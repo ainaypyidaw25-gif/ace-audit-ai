@@ -140,3 +140,72 @@ def test_question_is_sent_to_gemini_exactly_once(app_env, report, monkeypatch):
 
     assert calls == [("Which cost grew the most?", "Myanmar")]
     assert any("Answer to: Which cost grew the most?" in m.value for m in at.markdown)
+
+
+# --------------------------------------------------------------------------- review step
+@pytest.fixture
+def draft(jan, feb):
+    return {"id": "d1", "d1": jan, "d2": feb, "label1": "January", "label2": "February",
+            "title": "Review test", "file1_name": "jan.pdf", "file2_name": "feb.pdf"}
+
+
+def test_review_screen_shows_extracted_figures(app_env, draft):
+    at = _unlock(AppTest.from_file(APP))
+    at.session_state["draft"] = draft
+    _run(at)
+    assert at.number_input(key="rv_d1_1_total_expense").value == 43_600_000
+    assert at.text_input(key="rv_d1_0_period").value == "January 2026"
+    assert at.button(key="btn_confirm")
+    assert app_env.list_reports() == []                       # nothing saved before confirming
+
+
+def test_confirming_a_corrected_figure_saves_it_with_an_audit_record(app_env, draft, monkeypatch):
+    monkeypatch.setattr(ai, "generate_ceo_summary", lambda *a, **k: "- summary")
+    at = _unlock(AppTest.from_file(APP))
+    at.session_state["draft"] = draft
+    _run(at)
+
+    at.number_input(key="rv_d1_1_total_expense").set_value(44_000_000.0)
+    at.number_input(key="rv_d1_1_net_profit").set_value(10_500_000.0)
+    _run(at)
+    at.button(key="btn_confirm").click()
+    _run(at)
+
+    [row] = app_env.list_reports()
+    saved = app_env.get_report(row["id"])
+    assert saved["data2"]["total_expense"] == 44_000_000
+    fields = [c["field"] for c in saved["data2"]["_review"]["changes"]]
+    assert fields == ["total_expense", "net_profit"]
+    assert saved["data1"]["_review"]["edited"] is False
+    assert "draft" not in at.session_state
+    assert any(t("saved", MY, id=row["id"]) in s.value for s in at.success)
+
+
+def test_fix_button_sets_net_profit_to_income_minus_expense(app_env, draft):
+    draft["d2"]["net_profit"] = 1.0
+    at = _unlock(AppTest.from_file(APP))
+    at.session_state["draft"] = draft
+    _run(at)
+    at.button(key="rv_d1_1_fix_net").click()
+    _run(at)
+    assert at.number_input(key="rv_d1_1_net_profit").value == 10_900_000
+
+
+def test_discard_returns_to_upload_without_saving(app_env, draft):
+    at = _unlock(AppTest.from_file(APP))
+    at.session_state["draft"] = draft
+    _run(at)
+    at.button(key="btn_discard").click()
+    _run(at)
+    assert "draft" not in at.session_state
+    assert at.button(key="btn_extract")
+    assert app_env.list_reports() == []
+
+
+def test_saved_review_note_is_listed_on_the_report(app_env, report):
+    report["data2"]["_review"] = {"reviewed_at": "t", "edited": True, "changes": [
+        {"field": "total_expense", "from": 43_600_000.0, "to": 44_000_000.0}]}
+    app_env.save_report(report)
+    at = _unlock(AppTest.from_file(APP), lang=EN)
+    assert any("1 figure(s) in this report were corrected" in e.label for e in at.expander)
+    assert any("Total expense: 43,600,000 → 44,000,000" in m.value for m in at.markdown)

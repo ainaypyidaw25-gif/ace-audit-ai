@@ -6,6 +6,8 @@ and keeps a persistent history of every analysis.
 - **Myanmar and English** — the whole interface, alerts, AI answers and Excel export; Myanmar by default
 - **Passcode gate** — one shared passcode (`APP_PASSCODE`), no accounts
 - **AI extraction** — PDF / PNG / JPG / WEBP / XLSX / XLS / CSV → income, expenses, net profit, balances, line items
+- **Human review before saving** — extracted figures open in an editable form with live consistency checks and
+  one-click fixes; every correction is stored with the report as an audit trail
 - **Calculations** — totals, net variance, growth rate %, profit margin %, expense ratio, multiples
 - **CEO Quick Summary** — Gemini writes bullet-point insights with 🔴 red flags (Myanmar or English)
 - **Discrepancy alerts** — net ≠ income − expense, line items ≠ totals, balance roll-forward, abnormal swings
@@ -46,6 +48,10 @@ Two backends, chosen automatically:
 
 Streamlit Community Cloud wipes its filesystem on every reboot, so **use Supabase there** if the
 CEO needs month-over-month history. The sidebar always shows which backend is live.
+
+Without Supabase, use **Previous Reports → Backup & restore**: download a backup after saving new
+reports, and upload it after a redeploy. Restoring skips reports that are already stored, so the
+same backup can be uploaded twice safely.
 
 ### Supabase setup (5 minutes)
 

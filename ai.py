@@ -16,7 +16,7 @@ import pandas as pd
 from google import genai
 from google.genai import types
 
-from finance import normalize_statement
+from finance import normalize_statement, public_statement
 from i18n import EN, t
 
 EXTRACTION_SCHEMA = {
@@ -154,8 +154,8 @@ def report_context(rec: dict[str, Any]) -> dict[str, Any]:
         "labels": [rec.get("label1"), rec.get("label2")],
         "periods": [rec.get("period1"), rec.get("period2")],
         "currency": rec.get("currency"),
-        "previous_month": rec.get("data1"),
-        "current_month": rec.get("data2"),
+        "previous_month": public_statement(rec.get("data1")),
+        "current_month": public_statement(rec.get("data2")),
         "totals": (rec.get("metrics") or {}).get("totals"),
         "ratios": (rec.get("metrics") or {}).get("ratios"),
         "income_by_category": (rec.get("metrics") or {}).get("income_by_category"),

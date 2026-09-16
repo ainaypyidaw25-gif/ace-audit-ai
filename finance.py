@@ -138,6 +138,40 @@ def _tol(reference: float, rel: float) -> float:
     return max(1.0, abs(reference) * rel)
 
 
+def _make_alert(sev: str, code: str, **params: Any) -> dict[str, Any]:
+    from i18n import EN, render_alert  # local import: i18n has no dependencies, avoids cycles
+
+    params = {k: str(v) for k, v in params.items()}
+    return {"severity": sev, "code": code, "params": params, "message": render_alert(code, params, EN)}
+
+
+def _money(v: float) -> str:
+    return f"{v:,.0f}"
+
+
+def check_statement(d: dict, label: str) -> list[dict[str, Any]]:
+    """Checks that need only one statement: net = income − expense, line items add up to
+    the totals, and opening balance + net profit = closing balance."""
+    out: list[dict[str, Any]] = []
+    computed = d["total_income"] - d["total_expense"]
+    if abs(computed - d["net_profit"]) > _tol(d["net_profit"], 0.005):
+        out.append(_make_alert("error", "net_mismatch", label=label, stated=_money(d["net_profit"]),
+                               computed=_money(computed), gap=_money(d["net_profit"] - computed)))
+    inc_sum = items_to_df(d.get("income_items")).amount.sum()
+    exp_sum = items_to_df(d.get("expense_items")).amount.sum()
+    if inc_sum and abs(inc_sum - d["total_income"]) > _tol(d["total_income"], 0.01):
+        out.append(_make_alert("warning", "income_items_mismatch", label=label, items=_money(inc_sum),
+                               total=_money(d["total_income"])))
+    if exp_sum and abs(exp_sum - d["total_expense"]) > _tol(d["total_expense"], 0.01):
+        out.append(_make_alert("warning", "expense_items_mismatch", label=label, items=_money(exp_sum),
+                               total=_money(d["total_expense"])))
+    ob, cb = d.get("opening_balance") or 0, d.get("closing_balance") or 0
+    if (ob or cb) and abs(ob + d["net_profit"] - cb) > _tol(cb, 0.005):
+        out.append(_make_alert("warning", "balance_rollforward", label=label,
+                               expected=_money(ob + d["net_profit"]), closing=_money(cb)))
+    return out
+
+
 def build_alerts(d1: dict, d2: dict, metrics: dict, threshold: float,
                  label1: str = "Month 1", label2: str = "Month 2") -> list[dict[str, Any]]:
     """Return alerts as {"severity", "code", "params", "message"}.
@@ -146,36 +180,16 @@ def build_alerts(d1: dict, d2: dict, metrics: dict, threshold: float,
     `message` is the English text, kept for Excel export fallbacks and older reports.
     Numbers in `params` are pre-formatted strings so every language shows the same figures.
     """
-    from i18n import EN, render_alert  # local import: i18n has no dependencies, avoids cycles
-
     alerts: list[dict[str, Any]] = []
 
     def add(sev: str, code: str, **params: Any) -> None:
-        params = {k: str(v) for k, v in params.items()}
-        alerts.append({"severity": sev, "code": code, "params": params,
-                       "message": render_alert(code, params, EN)})
+        alerts.append(_make_alert(sev, code, **params))
 
-    def money(v: float) -> str:
-        return f"{v:,.0f}"
+    money = _money
 
     # Internal consistency of each statement
-    for label, d in ((label1, d1), (label2, d2)):
-        computed = d["total_income"] - d["total_expense"]
-        if abs(computed - d["net_profit"]) > _tol(d["net_profit"], 0.005):
-            add("error", "net_mismatch", label=label, stated=money(d["net_profit"]),
-                computed=money(computed), gap=money(d["net_profit"] - computed))
-        inc_sum = items_to_df(d.get("income_items")).amount.sum()
-        exp_sum = items_to_df(d.get("expense_items")).amount.sum()
-        if inc_sum and abs(inc_sum - d["total_income"]) > _tol(d["total_income"], 0.01):
-            add("warning", "income_items_mismatch", label=label, items=money(inc_sum),
-                total=money(d["total_income"]))
-        if exp_sum and abs(exp_sum - d["total_expense"]) > _tol(d["total_expense"], 0.01):
-            add("warning", "expense_items_mismatch", label=label, items=money(exp_sum),
-                total=money(d["total_expense"]))
-        ob, cb = d.get("opening_balance") or 0, d.get("closing_balance") or 0
-        if (ob or cb) and abs(ob + d["net_profit"] - cb) > _tol(cb, 0.005):
-            add("warning", "balance_rollforward", label=label, expected=money(ob + d["net_profit"]),
-                closing=money(cb))
+    alerts.extend(check_statement(d1, label1))
+    alerts.extend(check_statement(d2, label2))
 
     # Continuity between the two statements
     cb1, ob2 = d1.get("closing_balance") or 0, d2.get("opening_balance") or 0
@@ -226,3 +240,71 @@ def alert_counts(alerts: list[dict[str, str]]) -> dict[str, int]:
     for a in alerts:
         counts[a.get("severity", "info")] = counts.get(a.get("severity", "info"), 0) + 1
     return counts
+
+
+# --------------------------------------------------------------------------- #
+# Human review of AI-extracted figures
+# --------------------------------------------------------------------------- #
+REVIEW_KEY = "_review"
+SCALAR_FIELDS = ("period", "currency") + NUMERIC_FIELDS
+
+
+def clean_items(items: Any) -> list[dict[str, Any]]:
+    """Rows from an editable table -> [{"category", "amount"}], dropping blank rows."""
+    if isinstance(items, pd.DataFrame):
+        items = items.to_dict(orient="records")
+    out = []
+    for row in items or []:
+        cat = str(row.get("category") or "").strip()
+        try:
+            amount = float(row.get("amount") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if cat and cat.lower() != "nan":
+            out.append({"category": cat, "amount": amount})
+    return out
+
+
+def _items_signature(items: list[dict] | None) -> list[tuple[str, float]]:
+    return sorted((str(i.get("category", "")).strip(), round(float(i.get("amount") or 0), 2))
+                  for i in clean_items(items))
+
+
+def review_changes(original: dict, edited: dict) -> list[dict[str, Any]]:
+    """What a reviewer changed, field by field. Item lists are compared as a whole and
+    reported as count and total, which is what an auditor needs to see."""
+    changes: list[dict[str, Any]] = []
+    for f in SCALAR_FIELDS:
+        a, b = original.get(f), edited.get(f)
+        if f in NUMERIC_FIELDS:
+            a, b = float(a or 0), float(b or 0)
+            if abs(a - b) > 0.005:
+                changes.append({"field": f, "from": a, "to": b})
+        elif (a or "") != (b or ""):
+            changes.append({"field": f, "from": a, "to": b})
+    for f in ("income_items", "expense_items"):
+        a, b = _items_signature(original.get(f)), _items_signature(edited.get(f))
+        if a != b:
+            changes.append({"field": f,
+                            "from": {"rows": len(a), "total": sum(x[1] for x in a)},
+                            "to": {"rows": len(b), "total": sum(x[1] for x in b)}})
+    return changes
+
+
+def apply_review(original: dict, edited: dict, reviewed_at: str) -> dict[str, Any]:
+    """The statement to save: edited figures plus an audit record of what changed."""
+    body = {k: v for k, v in edited.items() if k != REVIEW_KEY}
+    # Clean item tables first: an editor DataFrame has no truth value, so normalize_statement's
+    # `items or []` would raise on it.
+    for f in ("income_items", "expense_items"):
+        body[f] = clean_items(body.get(f))
+    out = normalize_statement(body)
+    base = {k: v for k, v in original.items() if k != REVIEW_KEY}
+    changes = review_changes(base, out)
+    out[REVIEW_KEY] = {"reviewed_at": reviewed_at, "edited": bool(changes), "changes": changes}
+    return out
+
+
+def public_statement(d: dict) -> dict:
+    """Statement without internal bookkeeping keys, for prompts and summaries."""
+    return {k: v for k, v in (d or {}).items() if not str(k).startswith("_")}

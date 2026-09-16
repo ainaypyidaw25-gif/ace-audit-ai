@@ -240,6 +240,81 @@ def trend_frame() -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+# --------------------------------------------------------------------------- #
+# Backup / restore
+# --------------------------------------------------------------------------- #
+BACKUP_APP = "ace-audit-ai"
+BACKUP_VERSION = 1
+REQUIRED_FIELDS = ("title", "data1", "data2", "metrics", "alerts")
+
+
+class BackupError(ValueError):
+    """The uploaded file is not a usable ACE Audit AI backup."""
+
+
+def all_reports() -> list[dict[str, Any]]:
+    """Every stored report in full, oldest first."""
+    if using_supabase():
+        try:
+            res = _sb().table(TABLE).select("*").order("id", desc=False).execute()
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Could not read from Supabase: {exc}") from exc
+        return [dict(r) for r in (res.data or [])]
+    with _sqlite_connect() as conn:
+        rows = conn.execute("SELECT * FROM reports ORDER BY id ASC").fetchall()
+    return [_sqlite_row_to_rec(r) for r in rows]
+
+
+def make_backup(exported_at: str) -> bytes:
+    payload = {"app": BACKUP_APP, "version": BACKUP_VERSION, "exported_at": exported_at,
+               "reports": all_reports()}
+    return json.dumps(payload, ensure_ascii=False, indent=1, default=str).encode("utf-8")
+
+
+def parse_backup(raw: bytes) -> list[dict[str, Any]]:
+    """Validate a backup file and return its reports. Raises BackupError with a reason."""
+    try:
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BackupError("not_json") from exc
+    if not isinstance(payload, dict) or payload.get("app") != BACKUP_APP:
+        raise BackupError("wrong_app")
+    if int(payload.get("version") or 0) > BACKUP_VERSION:
+        raise BackupError("newer_version")
+    reports = payload.get("reports")
+    if not isinstance(reports, list):
+        raise BackupError("no_reports")
+    for r in reports:
+        if not isinstance(r, dict) or any(f not in r for f in REQUIRED_FIELDS):
+            raise BackupError("bad_report")
+    return reports
+
+
+def _fingerprint(rec: dict[str, Any]) -> tuple:
+    return (str(rec.get("created_at") or "")[:19], rec.get("title"),
+            rec.get("file1_name"), rec.get("file2_name"))
+
+
+def restore_reports(reports: list[dict[str, Any]]) -> tuple[int, int]:
+    """Insert reports that are not already stored. Returns (added, skipped).
+
+    Reports get new ids; a report counts as already stored when its creation time, title
+    and both file names match, so restoring the same backup twice adds nothing."""
+    existing = {_fingerprint(r) for r in all_reports()}
+    added = skipped = 0
+    for rec in reports:
+        fp = _fingerprint(rec)
+        if fp in existing:
+            skipped += 1
+            continue
+        clean = {f: rec.get(f) for f in _PLAIN_FIELDS + _JSON_FIELDS}
+        clean["created_at"] = str(clean.get("created_at") or "")[:19] or "1970-01-01T00:00:00"
+        save_report(clean)
+        existing.add(fp)
+        added += 1
+    return added, skipped
+
+
 def health_check() -> tuple[bool, str]:
     """Verify the active backend is reachable. Returns (ok, message)."""
     try:

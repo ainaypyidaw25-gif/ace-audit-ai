@@ -99,3 +99,14 @@ def test_excel_export_in_myanmar(report):
     assert wb["Totals"]["A3"].value == "စုစုပေါင်း ဝင်ငွေ"
     alert_cells = [wb["Alerts"].cell(r, 2).value for r in range(2, wb["Alerts"].max_row + 1)]
     assert all(MYANMAR_CHARS.search(c) for c in alert_cells)
+
+
+def test_every_interface_string_is_used_somewhere():
+    """Dead strings drift out of date and get translated for nothing."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    source = "\n".join((root / f).read_text() for f in ("app.py", "ai.py", "export.py", "storage.py"))
+    dynamic = {k for k in i18n.STRINGS if k.startswith("sev_")}      # built as f"sev_{severity}"
+    unused = [k for k in i18n.STRINGS if k not in dynamic and f'"{k}"' not in source and f"'{k}'" not in source]
+    assert not unused, f"unused i18n keys: {unused}"

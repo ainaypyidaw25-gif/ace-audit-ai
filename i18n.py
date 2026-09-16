@@ -68,12 +68,10 @@ STRINGS: dict[str, dict[str, str]] = {
     "upload_curr": {MY: "လက်ရှိလ ငွေစာရင်းဖိုင် တင်ပါ", EN: "Upload current month statement"},
     "report_title": {MY: "Report ခေါင်းစဉ်", EN: "Report title"},
     "title_default": {MY: "နှိုင်းယှဉ်စစ်ဆေးချက် {date}", EN: "Comparison {date}"},
-    "analyze": {MY: "🔍 စစ်ဆေး၊ အနှစ်ချုပ်ပြီး သိမ်းမည်", EN: "🔍 Analyze, Summarize & Save"},
     "need_key": {MY: "Sidebar တွင် Gemini API key ထည့်ပါ။", EN: "Enter your Gemini API key in the sidebar."},
     "reading": {MY: "{name} ကို ဖတ်နေသည်...", EN: "Reading {name}..."},
     "calculating": {MY: "တွက်ချက်ပြီး CEO အနှစ်ချုပ် ရေးနေသည်...",
                     EN: "Calculating and writing the CEO summary..."},
-    "done": {MY: "ပြီးပါပြီ", EN: "Done"},
     "saved": {MY: "Report #{id} အဖြစ် သိမ်းပြီးပါပြီ။ ယခင် Report များ tab တွင် ပြန်ကြည့်နိုင်ပါသည်။",
               EN: "Saved as report #{id} — available under Previous Reports."},
     "save_failed": {
@@ -81,6 +79,62 @@ STRINGS: dict[str, dict[str, str]] = {
             "အောက်တွင် ပြထားပါသည်။ မပျောက်စေရန် Excel သို့မဟုတ် JSON ဖိုင်ကို download လုပ်ထားပါ။",
         EN: "The analysis succeeded but could not be saved: {error}\n\n"
             "It is shown below — download the Excel or JSON file to keep it."},
+
+    # ---- review step --------------------------------------------------------
+    "extract": {MY: "📥 ဖိုင်များကို AI ဖြင့် ဖတ်မည်", EN: "📥 Read files with AI"},
+    "extract_hint": {
+        MY: "AI ဖတ်ပြီးနောက် ကိန်းဂဏန်းများကို စစ်ဆေးပြင်ဆင်ခွင့် ရပါမည်။ အတည်ပြုမှသာ တွက်ချက်ပြီး သိမ်းပါမည်။",
+        EN: "After AI reads the files you can check and correct the figures. Nothing is saved until you confirm."},
+    "review_h": {MY: "✏️ AI ဖတ်ယူထားသော ကိန်းဂဏန်းများကို စစ်ဆေးပါ",
+                 EN: "✏️ Check the figures AI extracted"},
+    "review_intro": {
+        MY: "မူရင်းဖိုင်နှင့် တိုက်စစ်ပြီး မှားနေသည်များကို ပြင်ပါ။ ဇယားတွင် စာကြောင်း ထပ်ထည့်၊ ဖျက်နိုင်ပါသည်။ "
+            "ပြင်ဆင်မှုတိုင်းကို audit မှတ်တမ်းအဖြစ် report နှင့်အတူ သိမ်းပါမည်။",
+        EN: "Compare with the original files and correct anything wrong. You can add or delete table rows. "
+            "Every change is saved with the report as an audit record."},
+    "f_period": {MY: "ကာလ", EN: "Period"},
+    "f_currency": {MY: "ငွေကြေး", EN: "Currency"},
+    "f_total_income": {MY: "စုစုပေါင်း ဝင်ငွေ", EN: "Total income"},
+    "f_total_expense": {MY: "စုစုပေါင်း ထွက်ငွေ", EN: "Total expense"},
+    "f_net_profit": {MY: "အသားတင်အမြတ်", EN: "Net profit"},
+    "f_opening_balance": {MY: "လက်ကျန်ငွေ (အစ)", EN: "Opening balance"},
+    "f_closing_balance": {MY: "လက်ကျန်ငွေ (အဆုံး)", EN: "Closing balance"},
+    "f_income_items": {MY: "ဝင်ငွေ အသေးစိတ်", EN: "Income line items"},
+    "f_expense_items": {MY: "ထွက်ငွေ အသေးစိတ်", EN: "Expense line items"},
+    "col_amount": {MY: "ပမာဏ", EN: "Amount"},
+    "checks_ok": {MY: "✅ ကိန်းဂဏန်းများ အချင်းချင်း ကိုက်ညီပါသည်။", EN: "✅ The figures are consistent."},
+    "use_computed_net": {MY: "အမြတ် = ဝင်ငွေ − ထွက်ငွေ ({value}) ကို သုံးမည်",
+                         EN: "Use income − expense ({value}) as net profit"},
+    "use_item_totals": {MY: "အသေးစိတ် ပေါင်းလဒ်များကို စုစုပေါင်းအဖြစ် သုံးမည်",
+                        EN: "Use line-item sums as the totals"},
+    "edited_count": {MY: "✏️ ပြင်ဆင်ထားသည် {n} ခု", EN: "✏️ {n} change(s) made"},
+    "confirm": {MY: "✅ အတည်ပြုပြီး စစ်ဆေး၊ သိမ်းမည်", EN: "✅ Confirm, analyze & save"},
+    "discard": {MY: "✖ ပယ်ဖျက်ပြီး အစမှ ပြန်စမည်", EN: "✖ Discard and start over"},
+    "review_saved_note": {MY: "✏️ ဤ report ၏ ကိန်းဂဏန်း {n} ခုကို လူကိုယ်တိုင် ပြင်ဆင်ထားပါသည်။",
+                          EN: "✏️ {n} figure(s) in this report were corrected by a person."},
+    "change_line": {MY: "{label} · {field}: {old} မှ {new} သို့", EN: "{label} · {field}: {old} → {new}"},
+    "rows_total": {MY: "{rows} ကြောင်း, စုစုပေါင်း {total}", EN: "{rows} rows, total {total}"},
+
+    # ---- backup -------------------------------------------------------------
+    "backup_h": {MY: "💾 Backup နှင့် Restore", EN: "💾 Backup & restore"},
+    "backup_intro": {
+        MY: "Streamlit Cloud တွင် redeploy လုပ်တိုင်း report များ ပျက်နိုင်ပါသည်။ Report အသစ် သိမ်းတိုင်း "
+            "backup ဖိုင်ကို download လုပ်ထားပြီး ပျက်သွားပါက ဤနေရာတွင် ပြန်တင်ပါ။",
+        EN: "Streamlit Cloud can erase reports on every redeploy. Download a backup after saving new reports, "
+            "and upload it here if they disappear."},
+    "backup_download": {MY: "💾 Report အားလုံး backup ယူမည်", EN: "💾 Download backup of all reports"},
+    "restore_upload": {MY: "Backup ဖိုင် (.json) တင်ပါ", EN: "Upload a backup file (.json)"},
+    "restore_button": {MY: "♻️ Backup မှ ပြန်ထည့်မည်", EN: "♻️ Restore from backup"},
+    "restore_done": {MY: "Report {added} ခု ပြန်ထည့်ပြီးပါပြီ။ ရှိပြီးသား {skipped} ခုကို ကျော်ခဲ့ပါသည်။",
+                     EN: "Restored {added} report(s). Skipped {skipped} already stored."},
+    "backup_not_json": {MY: "ဤဖိုင်သည် JSON ဖိုင် မဟုတ်ပါ။", EN: "This file is not JSON."},
+    "backup_wrong_app": {MY: "ဤဖိုင်သည် ACE Audit AI backup ဖိုင် မဟုတ်ပါ။",
+                         EN: "This is not an ACE Audit AI backup file."},
+    "backup_newer_version": {MY: "ဤ backup ကို app version အသစ်က ထုတ်ထားပါသည်။ App ကို update လုပ်ပြီးမှ ပြန်တင်ပါ။",
+                             EN: "This backup comes from a newer app version. Update the app first."},
+    "backup_no_reports": {MY: "Backup ဖိုင်ထဲတွင် report စာရင်း မပါပါ။", EN: "The backup has no report list."},
+    "backup_bad_report": {MY: "Backup ဖိုင်ထဲရှိ report တစ်ခု မပြည့်စုံပါ။ ဖိုင် ပျက်နေနိုင်ပါသည်။",
+                          EN: "A report in the backup is incomplete. The file may be damaged."},
 
     # ---- history ------------------------------------------------------------
     "storage_error": {MY: "Report သိမ်းဆည်းရာသို့ မချိတ်ဆက်နိုင်ပါ: {error}",

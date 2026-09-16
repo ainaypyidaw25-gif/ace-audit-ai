@@ -28,6 +28,7 @@ import hmac
 import html
 import json
 import os
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -37,8 +38,10 @@ import streamlit as st
 import ai
 import export
 import storage
-from finance import (alert_counts, build_alerts, compute_metrics, display_period, distinct_labels,
-                     fmt_money, fmt_pct, is_missing, pct_change, safe_div)
+from finance import (REVIEW_KEY, alert_counts, apply_review, build_alerts, check_statement,
+                     clean_items, compute_metrics, display_period, distinct_labels, fmt_money,
+                     fmt_pct, is_missing, items_to_df, pct_change, public_statement, review_changes,
+                     safe_div)
 from i18n import AI_LANGUAGE, LANGUAGES, MY, alert_text, item_name, ratio_name, t
 
 # =========================================================================== #
@@ -182,6 +185,203 @@ def render_qa(rec: dict[str, Any], key_prefix: str, api_key: str, model: str, la
         st.rerun()
 
 
+FIELD_KEYS = {"period": "f_period", "currency": "f_currency", "total_income": "f_total_income",
+              "total_expense": "f_total_expense", "net_profit": "f_net_profit",
+              "opening_balance": "f_opening_balance", "closing_balance": "f_closing_balance",
+              "income_items": "f_income_items", "expense_items": "f_expense_items"}
+
+
+def _fmt_change_value(v: Any, lang: str) -> str:
+    if isinstance(v, dict):
+        return t("rows_total", lang, rows=v.get("rows", 0), total=fmt_money(v.get("total")))
+    if isinstance(v, (int, float)):
+        return fmt_money(v)
+    return str(v if v not in (None, "") else "—")
+
+
+def render_review_note(rec: dict[str, Any], lang: str) -> None:
+    """Audit trail: show which figures a person corrected before the report was saved."""
+    lines = []
+    for label, d in ((rec["label1"], rec["data1"]), (rec["label2"], rec["data2"])):
+        for c in ((d or {}).get(REVIEW_KEY) or {}).get("changes") or []:
+            lines.append(t("change_line", lang, label=label, field=t(FIELD_KEYS.get(c["field"], "f_period"), lang)
+                           if c["field"] in FIELD_KEYS else c["field"],
+                           old=_fmt_change_value(c.get("from"), lang),
+                           new=_fmt_change_value(c.get("to"), lang)))
+    if lines:
+        with st.expander(t("review_saved_note", lang, n=len(lines))):
+            for line in lines:
+                st.markdown(f"- {html.escape(line)}")
+
+
+def _set_state(key: str, value: Any) -> None:
+    st.session_state[key] = value
+
+
+def _statement_editor(d: dict[str, Any], idx: int, draft_id: str, label: str, lang: str) -> dict[str, Any]:
+    """Editable copy of one extracted statement, with live consistency checks."""
+    k = f"rv_{draft_id}_{idx}_"
+    with st.container(border=True):
+        st.markdown(f"#### {idx + 1}. {html.escape(label)}")
+        # Seed widget state once and never pass `value=` as well: the fix buttons write to these
+        # keys, and Streamlit warns on screen when a widget has both a default and a state value.
+        seeds = {"period": d.get("period") or "", "currency": d.get("currency") or ""}
+        seeds.update({f: float(d.get(f) or 0.0) for f in ("total_income", "total_expense", "net_profit",
+                                                          "opening_balance", "closing_balance")})
+        for f, v in seeds.items():
+            st.session_state.setdefault(k + f, v)
+
+        c1, c2 = st.columns(2)
+        period = c1.text_input(t("f_period", lang), key=k + "period")
+        currency = c2.text_input(t("f_currency", lang), key=k + "currency")
+
+        # Two per row keeps nine-digit kyat amounts readable; number inputs cannot show commas,
+        # so each one gets a formatted caption underneath.
+        nums: dict[str, float] = {}
+        for row in (("total_income", "total_expense"), ("net_profit", None),
+                    ("opening_balance", "closing_balance")):
+            for col, f in zip(st.columns(2), row):
+                if f is None:
+                    continue
+                nums[f] = col.number_input(t(FIELD_KEYS[f], lang), step=1000.0, format="%.0f", key=k + f)
+                col.caption(fmt_money(nums[f], currency))
+
+        column_config = {
+            "category": st.column_config.TextColumn(t("col_category", lang), required=True),
+            "amount": st.column_config.NumberColumn(t("col_amount", lang), format="localized",
+                                                    required=True),
+        }
+        items: dict[str, list[dict[str, Any]]] = {}
+        for f in ("income_items", "expense_items"):
+            st.markdown(f"**{t(FIELD_KEYS[f], lang)}**")
+            start = pd.DataFrame(clean_items(d.get(f)), columns=["category", "amount"])
+            edited = st.data_editor(start, key=k + f, num_rows="dynamic", hide_index=True,
+                                    width="stretch", column_config=column_config)
+            items[f] = clean_items(edited)
+
+        edited_stmt = {**d, "period": period, "currency": currency, **nums, **items}
+
+        # Live checks and one-click fixes for the two most common extraction slips.
+        problems = check_statement(edited_stmt, label)
+        if not problems:
+            st.success(t("checks_ok", lang))
+        for a in problems:
+            getattr(st, a["severity"])(alert_text(a, lang))
+        codes = {a["code"] for a in problems}
+        b1, b2 = st.columns(2)
+        if "net_mismatch" in codes:
+            computed = nums["total_income"] - nums["total_expense"]
+            b1.button(t("use_computed_net", lang, value=fmt_money(computed)), key=k + "fix_net",
+                      on_click=_set_state, args=(k + "net_profit", computed))
+        if codes & {"income_items_mismatch", "expense_items_mismatch"}:
+            def _use_item_totals(inc=float(items_to_df(items["income_items"]).amount.sum()),
+                                 exp=float(items_to_df(items["expense_items"]).amount.sum())):
+                if inc:
+                    st.session_state[k + "total_income"] = inc
+                if exp:
+                    st.session_state[k + "total_expense"] = exp
+                st.session_state[k + "net_profit"] = (inc or nums["total_income"]) - (exp or nums["total_expense"])
+            b2.button(t("use_item_totals", lang), key=k + "fix_items", on_click=_use_item_totals)
+
+        n_changes = len(review_changes({k2: v for k2, v in d.items() if k2 != REVIEW_KEY}, edited_stmt))
+        if n_changes:
+            st.caption(t("edited_count", lang, n=n_changes))
+    return edited_stmt
+
+
+def render_review(draft: dict[str, Any], lang: str, api_key: str, model: str, threshold: float) -> None:
+    """Step 2 of an analysis: a person checks the AI-extracted figures before anything is saved."""
+    st.markdown(f"### {t('review_h', lang)}")
+    st.info(t("review_intro", lang))
+    e1 = _statement_editor(draft["d1"], 0, draft["id"], draft["label1"], lang)
+    e2 = _statement_editor(draft["d2"], 1, draft["id"], draft["label2"], lang)
+
+    c1, c2, _ = st.columns([2, 2, 1])
+    confirm = c1.button(t("confirm", lang), type="primary", key="btn_confirm", width="stretch")
+    if c2.button(t("discard", lang), key="btn_discard", width="stretch"):
+        st.session_state.pop("draft", None)
+        st.rerun()
+    if not confirm:
+        return
+
+    now = datetime.now().isoformat(timespec="seconds")
+    d1 = apply_review(draft["d1"], e1, now)
+    d2 = apply_review(draft["d2"], e2, now)
+    label1, label2 = draft["label1"], draft["label2"]
+    try:
+        with st.spinner(t("calculating", lang)):
+            metrics = compute_metrics(d1, d2, label1, label2)
+            alerts = build_alerts(d1, d2, metrics, threshold, label1, label2)
+            summary = ai.generate_ceo_summary(
+                api_key, model,
+                {"labels": [label1, label2], "month1": public_statement(d1), "month2": public_statement(d2),
+                 "totals": metrics["totals"], "ratios": metrics["ratios"],
+                 "alerts": [a["message"] for a in alerts]},
+                AI_LANGUAGE[lang],
+            )
+    except Exception as exc:  # noqa: BLE001
+        st.error(ai.friendly_error(exc, model, lang))
+        return
+
+    rec = {
+        "created_at": now, "title": draft["title"], "label1": label1, "label2": label2,
+        "period1": d1.get("period"), "period2": d2.get("period"),
+        "currency": d2.get("currency") or d1.get("currency") or "",
+        "file1_name": draft["file1_name"], "file2_name": draft["file2_name"], "model": model,
+        "data1": d1, "data2": d2, "metrics": metrics, "alerts": alerts, "summary": summary,
+    }
+    try:
+        rec["id"] = storage.save_report(rec)
+        flash("new", "success", t("saved", lang, id=rec["id"]))
+    except Exception as exc:  # noqa: BLE001 - never lose an analysis that already cost API calls
+        rec["id"] = "unsaved"
+        flash("new", "warning", t("save_failed", lang, error=exc))
+    st.session_state["last_report"] = rec
+    st.session_state.pop("draft", None)
+    st.rerun()
+
+
+BACKUP_ERRORS = {"not_json": "backup_not_json", "wrong_app": "backup_wrong_app",
+                 "newer_version": "backup_newer_version", "no_reports": "backup_no_reports",
+                 "bad_report": "backup_bad_report"}
+
+
+def render_backup(lang: str) -> None:
+    with st.expander(t("backup_h", lang)):
+        st.caption(t("backup_intro", lang))
+        now = datetime.now()
+        try:
+            st.download_button(t("backup_download", lang), data=storage.make_backup(now.isoformat(timespec="seconds")),
+                               file_name=f"ace_audit_backup_{now:%Y%m%d_%H%M}.json", mime="application/json",
+                               key="btn_backup")
+        except Exception as exc:  # noqa: BLE001
+            st.error(t("storage_error", lang, error=exc))
+        upload = st.file_uploader(t("restore_upload", lang), type=["json"], key="restore_file")
+        if st.button(t("restore_button", lang), key="btn_restore", disabled=upload is None):
+            try:
+                added, skipped = storage.restore_reports(storage.parse_backup(upload.getvalue()))
+            except storage.BackupError as exc:
+                st.error(t(BACKUP_ERRORS.get(str(exc), "backup_bad_report"), lang))
+            except Exception as exc:  # noqa: BLE001
+                st.error(t("storage_error", lang, error=exc))
+            else:
+                flash("history", "success", t("restore_done", lang, added=added, skipped=skipped))
+                st.rerun()
+
+
+def flash(where: str, severity: str, message: str) -> None:
+    """Queue a one-off message to show after st.rerun(). `where` names the tab that shows it:
+    every tab runs on every rerun, so a shared message would be consumed by whichever tab
+    happened to render first, usually one the user is not looking at."""
+    st.session_state[f"flash_{where}"] = (severity, message)
+
+
+def show_flash(where: str) -> None:
+    item = st.session_state.pop(f"flash_{where}", None)
+    if item:
+        getattr(st, item[0])(item[1])
+
+
 def render_report(rec: dict[str, Any], key_prefix: str, api_key: str, model: str, lang: str) -> None:
     """Render a full report. `key_prefix` keeps widget keys unique: Streamlit runs every
     tab in the same script pass, so the same report can be drawn twice in one run."""
@@ -192,6 +392,7 @@ def render_report(rec: dict[str, Any], key_prefix: str, api_key: str, model: str
     st.caption(t("caption", lang, l1=l1, p1=display_period(rec.get("period1"), "—"),
                  l2=l2, p2=display_period(rec.get("period2"), "—"), cur=cur or "?",
                  f1=rec.get("file1_name"), f2=rec.get("file2_name")))
+    render_review_note(rec, lang)
 
     c1, c2, c3, c4 = st.columns(4)
     metric_card(c1, t("card_income", lang), fmt_money(d2["total_income"], cur),
@@ -341,66 +542,52 @@ tab_new, tab_history, tab_trend = st.tabs([t("tab_new", lang), t("tab_history", 
 
 # --------------------------------------------------------------------------- #
 with tab_new:
-    c1, c2 = st.columns(2)
-    with c1:
-        label1_in = st.text_input(t("prev_label", lang), t("prev_default", lang), key=f"label1_{lang}")
-        file1 = st.file_uploader(t("upload_prev", lang), type=ACCEPTED_TYPES, key="f1")
-    with c2:
-        label2_in = st.text_input(t("curr_label", lang), t("curr_default", lang), key=f"label2_{lang}")
-        file2 = st.file_uploader(t("upload_curr", lang), type=ACCEPTED_TYPES, key="f2")
-    title = st.text_input(t("report_title", lang), t("title_default", lang, date=f"{datetime.now():%Y-%m-%d}"),
-                          key=f"title_{lang}")
-    label1, label2 = distinct_labels(label1_in, label2_in)
+    show_flash("new")
+    draft = st.session_state.get("draft")
+    if draft:
+        render_review(draft, lang, api_key, model, threshold)
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            label1_in = st.text_input(t("prev_label", lang), t("prev_default", lang), key=f"label1_{lang}")
+            file1 = st.file_uploader(t("upload_prev", lang), type=ACCEPTED_TYPES, key="f1")
+        with c2:
+            label2_in = st.text_input(t("curr_label", lang), t("curr_default", lang), key=f"label2_{lang}")
+            file2 = st.file_uploader(t("upload_curr", lang), type=ACCEPTED_TYPES, key="f2")
+        title = st.text_input(t("report_title", lang),
+                              t("title_default", lang, date=f"{datetime.now():%Y-%m-%d}"), key=f"title_{lang}")
+        label1, label2 = distinct_labels(label1_in, label2_in)
+        st.caption(t("extract_hint", lang))
 
-    if st.button(t("analyze", lang), type="primary", disabled=not (file1 and file2), key="btn_analyze"):
-        if not api_key:
-            st.error(t("need_key", lang))
-            st.stop()
-        progress = st.progress(0, text=t("reading", lang, name=file1.name))
-        try:
-            d1 = extract_cached(api_key, model, file1.getvalue(), file1.name)
-            progress.progress(35, text=t("reading", lang, name=file2.name))
-            d2 = extract_cached(api_key, model, file2.getvalue(), file2.name)
-            progress.progress(70, text=t("calculating", lang))
-            metrics = compute_metrics(d1, d2, label1, label2)
-            alerts = build_alerts(d1, d2, metrics, threshold, label1, label2)
-            summary = ai.generate_ceo_summary(
-                api_key, model,
-                {"labels": [label1, label2], "month1": d1, "month2": d2,
-                 "totals": metrics["totals"], "ratios": metrics["ratios"],
-                 "alerts": [a["message"] for a in alerts]},
-                AI_LANGUAGE[lang],
-            )
-            progress.progress(100, text=t("done", lang))
-        except Exception as exc:  # noqa: BLE001
+        if st.button(t("extract", lang), type="primary", disabled=not (file1 and file2), key="btn_extract"):
+            if not api_key:
+                st.error(t("need_key", lang))
+                st.stop()
+            progress = st.progress(0, text=t("reading", lang, name=file1.name))
+            try:
+                d1 = extract_cached(api_key, model, file1.getvalue(), file1.name)
+                progress.progress(50, text=t("reading", lang, name=file2.name))
+                d2 = extract_cached(api_key, model, file2.getvalue(), file2.name)
+            except Exception as exc:  # noqa: BLE001
+                progress.empty()
+                st.error(ai.friendly_error(exc, model, lang))
+                st.stop()
             progress.empty()
-            st.error(ai.friendly_error(exc, model, lang))
-            st.stop()
-        progress.empty()
+            st.session_state["draft"] = {
+                "id": uuid.uuid4().hex[:8], "d1": d1, "d2": d2, "label1": label1, "label2": label2,
+                "title": title.strip() or t("title_default", lang, date=f"{datetime.now():%Y-%m-%d}"),
+                "file1_name": file1.name, "file2_name": file2.name,
+            }
+            st.rerun()
 
-        rec = {
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "title": title.strip() or t("title_default", lang, date=f"{datetime.now():%Y-%m-%d}"),
-            "label1": label1, "label2": label2,
-            "period1": d1.get("period"), "period2": d2.get("period"),
-            "currency": d2.get("currency") or d1.get("currency") or "",
-            "file1_name": file1.name, "file2_name": file2.name, "model": model,
-            "data1": d1, "data2": d2, "metrics": metrics, "alerts": alerts, "summary": summary,
-        }
-        try:
-            rec["id"] = storage.save_report(rec)
-            st.success(t("saved", lang, id=rec["id"]))
-        except Exception as exc:  # noqa: BLE001 - never lose an analysis that already cost API calls
-            rec["id"] = "unsaved"
-            st.warning(t("save_failed", lang, error=exc))
-        st.session_state["last_report"] = rec
-
-    if "last_report" in st.session_state:
+    if "last_report" in st.session_state and not draft:
         st.markdown("---")
         render_report(st.session_state["last_report"], "latest", api_key, model, lang)
 
 # --------------------------------------------------------------------------- #
 with tab_history:
+    show_flash("history")
+    render_backup(lang)
     try:
         reports = storage.list_reports()
     except Exception as exc:  # noqa: BLE001
