@@ -40,7 +40,19 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Put your settings in `.streamlit/secrets.toml` (see `secrets.toml.example`):
+### Setting secrets
+
+Two helper scripts avoid hand-editing TOML (a stray quote or an unsaved editor buffer is the
+usual cause of "key not found"):
+
+```bash
+python3 configure.py                      # prompts for all four values, input hidden
+python3 set_secret.py GEMINI_API_KEY      # takes one value from the macOS clipboard
+```
+
+`set_secret.py` accepts `APP_PASSCODE`, `GEMINI_API_KEY`, `SUPABASE_URL` or `SUPABASE_KEY`, and
+rejects an obviously wrong paste (a URL where a key belongs, and vice versa). Neither script ever
+prints a secret back. Or edit `.streamlit/secrets.toml` directly (see `secrets.toml.example`):
 
 ```toml
 APP_PASSCODE   = "your-passcode"
