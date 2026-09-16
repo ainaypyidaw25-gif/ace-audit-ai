@@ -209,3 +209,12 @@ def test_saved_review_note_is_listed_on_the_report(app_env, report):
     at = _unlock(AppTest.from_file(APP), lang=EN)
     assert any("1 figure(s) in this report were corrected" in e.label for e in at.expander)
     assert any("Total expense: 43,600,000 → 44,000,000" in m.value for m in at.markdown)
+
+
+@pytest.mark.parametrize("lang", [MY, EN])
+def test_file_uploader_text_is_translated(app_env, lang):
+    """Streamlit's uploader text is fixed English; app.py swaps it via CSS per language."""
+    at = _unlock(AppTest.from_file(APP), lang=lang)
+    css = next(m.value for m in at.markdown if "stFileUploaderDropzoneInstructions" in m.value)
+    for key in ("upload_drop", "upload_limit", "upload_browse"):
+        assert t(key, lang) in css

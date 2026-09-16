@@ -113,6 +113,26 @@ st.markdown(
 )
 
 
+def uploader_text_css(lang: str) -> None:
+    """Streamlit's file uploader has fixed English text and no option to change it, so hide
+    those spans and draw translated text with CSS pseudo-elements instead."""
+    def css_str(text: str) -> str:
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    st.markdown(f"""
+<style>
+  [data-testid="stFileUploaderDropzoneInstructions"] > div > span {{ display: none; }}
+  [data-testid="stFileUploaderDropzoneInstructions"] > div::before {{
+    content: {css_str(t("upload_drop", lang))}; display: block; margin-bottom: .25rem; }}
+  [data-testid="stFileUploaderDropzoneInstructions"] > div::after {{
+    content: {css_str(t("upload_limit", lang))}; display: block; font-size: .8rem; opacity: .65; }}
+  [data-testid="stFileUploaderDropzone"] [data-testid="stBaseButton-secondary"] {{ font-size: 0; }}
+  [data-testid="stFileUploaderDropzone"] [data-testid="stBaseButton-secondary"]::after {{
+    content: {css_str(t("upload_browse", lang))}; font-size: 1rem; }}
+</style>
+""", unsafe_allow_html=True)
+
+
 def hero(lang: str, tagline_key: str) -> None:
     st.markdown(f'<div class="ace-hero"><h1>📊 ACE Audit AI</h1>'
                 f'<p>{t("subtitle", lang)} · {t(tagline_key, lang)}</p></div>',
@@ -536,6 +556,7 @@ with st.sidebar:
 # Main
 # =========================================================================== #
 hero(lang, "powered")
+uploader_text_css(lang)
 
 tab_new, tab_history, tab_trend = st.tabs([t("tab_new", lang), t("tab_history", lang),
                                            t("tab_trend", lang)])
