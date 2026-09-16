@@ -38,7 +38,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-MODEL_OPTIONS = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
+MODEL_OPTIONS = ["gemini-flash-latest", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-pro-latest"]
 DEFAULT_ALERT_THRESHOLD = 30.0
 DB_PATH = Path(os.environ.get("ACE_DB_PATH", "data/ace_audit.db"))
 ACCEPTED_TYPES = ["pdf", "png", "jpg", "jpeg", "webp", "xlsx", "xls", "csv"]
