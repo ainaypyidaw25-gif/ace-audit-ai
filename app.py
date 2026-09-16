@@ -38,7 +38,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-MODEL_OPTIONS = ["gemini-flash-latest", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-pro-latest"]
+MODEL_OPTIONS = ["gemini-flash-latest", "gemini-3.8-flash", "gemini-3.6-flash",
+                 "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+                 "gemini-pro-latest"]
 DEFAULT_ALERT_THRESHOLD = 30.0
 DB_PATH = Path(os.environ.get("ACE_DB_PATH", "data/ace_audit.db"))
 ACCEPTED_TYPES = ["pdf", "png", "jpg", "jpeg", "webp", "xlsx", "xls", "csv"]
@@ -293,6 +295,22 @@ DATA:
 # =========================================================================== #
 # Calculations
 # =========================================================================== #
+def friendly_error(exc: Exception, model: str) -> str:
+    """Turn a raw Gemini API error into one line a non-engineer can act on."""
+    msg = str(exc)
+    if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+        return (f"Daily free-tier quota for **{model}** is used up. Pick a different model in the "
+                "sidebar and try again, or add billing to your Google AI Studio project.")
+    if "404" in msg or "NOT_FOUND" in msg:
+        return (f"The model **{model}** is not available to this API key. Choose another model "
+                "in the sidebar.")
+    if "401" in msg or "403" in msg or "API_KEY" in msg.upper() or "PERMISSION" in msg.upper():
+        return "The Gemini API key was rejected. Check the key in the sidebar or in Secrets."
+    if "DeadlineExceeded" in msg or "timeout" in msg.lower():
+        return "Gemini timed out. Try again, or use a smaller file."
+    return f"Analysis failed: {msg[:300]}"
+
+
 def pct_change(old: float, new: float) -> float | None:
     return None if old == 0 else (new - old) / abs(old) * 100.0
 
@@ -604,7 +622,7 @@ with tab_new:
                     language,
                 )
         except Exception as exc:  # noqa: BLE001
-            st.error(f"Analysis failed: {exc}")
+            st.error(friendly_error(exc, model))
             st.stop()
 
         rec = {
