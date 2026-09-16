@@ -5,10 +5,11 @@ ACE Audit AI - Executive Financial Comparison Dashboard (single-user)
 - Gemini extracts figures from PDF / image / Excel / CSV statements
 - Add / subtract / multiply / divide comparisons + red-flag alerts
 - Gemini writes a CEO bullet-point summary
-- Every analysis is stored in SQLite (history + trend viewer)
+- Every analysis is stored in Supabase (Postgres) when configured, else SQLite
 
 Run:     streamlit run app.py
-Config:  APP_PASSCODE, GEMINI_API_KEY via env vars or .streamlit/secrets.toml
+Config:  APP_PASSCODE, GEMINI_API_KEY and optionally SUPABASE_URL / SUPABASE_KEY
+         via env vars or .streamlit/secrets.toml
 """
 
 from __future__ import annotations
@@ -18,15 +19,15 @@ import io
 import json
 import os
 import re
-import sqlite3
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import streamlit as st
 from google import genai
 from google.genai import types
+
+import storage
 
 # =========================================================================== #
 # Configuration
@@ -42,7 +43,6 @@ MODEL_OPTIONS = ["gemini-flash-latest", "gemini-3.8-flash", "gemini-3.6-flash",
                  "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
                  "gemini-pro-latest"]
 DEFAULT_ALERT_THRESHOLD = 30.0
-DB_PATH = Path(os.environ.get("ACE_DB_PATH", "data/ace_audit.db"))
 ACCEPTED_TYPES = ["pdf", "png", "jpg", "jpeg", "webp", "xlsx", "xls", "csv"]
 
 
@@ -89,103 +89,6 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
-
-# =========================================================================== #
-# Database (SQLite) - persistent history
-# =========================================================================== #
-def db_connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS reports (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at   TEXT NOT NULL,
-            title        TEXT NOT NULL,
-            label1       TEXT, label2 TEXT,
-            period1      TEXT, period2 TEXT,
-            currency     TEXT,
-            file1_name   TEXT, file2_name TEXT,
-            model        TEXT,
-            data1_json   TEXT NOT NULL,
-            data2_json   TEXT NOT NULL,
-            metrics_json TEXT NOT NULL,
-            alerts_json  TEXT NOT NULL,
-            summary      TEXT
-        )
-        """
-    )
-    return conn
-
-
-def db_save_report(rec: dict[str, Any]) -> int:
-    with db_connect() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO reports (created_at, title, label1, label2, period1, period2, currency,
-                                 file1_name, file2_name, model, data1_json, data2_json,
-                                 metrics_json, alerts_json, summary)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                rec["created_at"], rec["title"], rec["label1"], rec["label2"],
-                rec["period1"], rec["period2"], rec["currency"],
-                rec["file1_name"], rec["file2_name"], rec["model"],
-                json.dumps(rec["data1"], ensure_ascii=False),
-                json.dumps(rec["data2"], ensure_ascii=False),
-                json.dumps(rec["metrics"], ensure_ascii=False, default=str),
-                json.dumps(rec["alerts"], ensure_ascii=False),
-                rec["summary"],
-            ),
-        )
-        return int(cur.lastrowid)
-
-
-def db_list_reports() -> list[sqlite3.Row]:
-    with db_connect() as conn:
-        return conn.execute(
-            "SELECT id, created_at, title, period1, period2, currency FROM reports ORDER BY id DESC"
-        ).fetchall()
-
-
-def db_get_report(report_id: int) -> dict[str, Any] | None:
-    with db_connect() as conn:
-        row = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
-    if not row:
-        return None
-    rec = dict(row)
-    rec["data1"] = json.loads(rec.pop("data1_json"))
-    rec["data2"] = json.loads(rec.pop("data2_json"))
-    rec["metrics"] = json.loads(rec.pop("metrics_json"))
-    rec["alerts"] = json.loads(rec.pop("alerts_json"))
-    return rec
-
-
-def db_delete_report(report_id: int) -> None:
-    with db_connect() as conn:
-        conn.execute("DELETE FROM reports WHERE id = ?", (report_id,))
-
-
-def db_trend_frame() -> pd.DataFrame:
-    """One row per stored report using the *Month 2* (current) figures for trend lines."""
-    with db_connect() as conn:
-        rows = conn.execute(
-            "SELECT id, created_at, title, period2, data2_json FROM reports ORDER BY id ASC"
-        ).fetchall()
-    out = []
-    for r in rows:
-        d = json.loads(r["data2_json"])
-        out.append({
-            "Report #": r["id"],
-            "Saved": r["created_at"][:16],
-            "Period": r["period2"] or r["title"],
-            "Income": float(d.get("total_income") or 0),
-            "Expense": float(d.get("total_expense") or 0),
-            "Net Profit": float(d.get("net_profit") or 0),
-        })
-    return pd.DataFrame(out)
-
 
 # =========================================================================== #
 # Gemini - extraction
@@ -577,7 +480,7 @@ with st.sidebar:
     threshold = st.slider("Red-flag threshold (% change)", 5.0, 100.0, DEFAULT_ALERT_THRESHOLD, 5.0)
     st.markdown("---")
     report_count_slot = st.empty()  # filled at the end so a fresh save is reflected immediately
-    st.caption(f"Database: `{DB_PATH}`")
+    st.caption(f"Storage: {storage.backend_label()}")
     st.markdown("---")
     if st.button("🔒 Lock dashboard"):
         st.session_state.clear()
@@ -634,8 +537,13 @@ with tab_new:
             "file1_name": file1.name, "file2_name": file2.name, "model": model,
             "data1": d1, "data2": d2, "metrics": metrics, "alerts": alerts, "summary": summary,
         }
-        rec["id"] = db_save_report(rec)
-        st.success(f"Saved as report #{rec['id']} — available under Previous Reports.")
+        try:
+            rec["id"] = storage.save_report(rec)
+            st.success(f"Saved as report #{rec['id']} — available under Previous Reports.")
+        except Exception as exc:  # noqa: BLE001 - never lose an analysis that already cost API calls
+            rec["id"] = "unsaved"
+            st.warning(f"The analysis succeeded but could not be saved: {exc}\n\n"
+                       "It is shown below — download the JSON to keep it.")
         st.session_state["last_report"] = rec
 
     if "last_report" in st.session_state:
@@ -644,27 +552,35 @@ with tab_new:
 
 # --------------------------------------------------------------------------- #
 with tab_history:
-    reports = db_list_reports()
+    try:
+        reports = storage.list_reports()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Cannot reach report storage: {exc}")
+        reports = []
     if not reports:
         st.info("No reports saved yet. Run an analysis in the New Analysis tab.")
     else:
-        options = {f"#{r['id']} · {r['created_at'][:16]} · {r['title']} "
+        options = {f"#{r['id']} · {str(r['created_at'])[:16]} · {r['title']} "
                    f"({r['period1'] or '?'} → {r['period2'] or '?'})": r["id"] for r in reports}
         choice = st.selectbox("Select a past report", list(options.keys()))
         rid = options[choice]
-        rec = db_get_report(rid)
+        rec = storage.get_report(rid)
         if rec:
             hc1, hc2 = st.columns([6, 1])
             hc1.markdown(f"#### {rec['title']}")
             if hc2.button("🗑️ Delete", key=f"del_{rid}"):
-                db_delete_report(rid)
+                storage.delete_report(rid)
                 st.session_state.pop("last_report", None)
                 st.rerun()
             render_report(rec)
 
 # --------------------------------------------------------------------------- #
 with tab_trend:
-    trend = db_trend_frame()
+    try:
+        trend = storage.trend_frame()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Cannot reach report storage: {exc}")
+        trend = pd.DataFrame()
     if len(trend) < 2:
         st.info("Trend lines appear once at least two reports are saved.")
     else:
@@ -676,5 +592,8 @@ with tab_trend:
                                          "Net Profit": "{:,.0f}", "Profit Margin %": "{:.1f}%"}),
                      use_container_width=True, hide_index=True)
 
-# Sidebar report counter is filled last so a report saved in this run is counted.
-report_count_slot.markdown(f"**📚 Stored reports:** {len(db_list_reports())}")
+# Sidebar counter is filled last so a report saved during this run is included.
+try:
+    report_count_slot.markdown(f"**📚 Stored reports:** {len(storage.list_reports())}")
+except Exception as exc:  # noqa: BLE001
+    report_count_slot.error(f"Storage unreachable: {str(exc)[:120]}")

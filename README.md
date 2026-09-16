@@ -8,35 +8,56 @@ and keeps a persistent history of every analysis.
 - **Calculations** — totals, net variance, growth rate %, profit margin %, expense ratio, multiples
 - **CEO Quick Summary** — Gemini writes bullet-point insights with 🔴 red flags (Myanmar or English)
 - **Discrepancy alerts** — net ≠ income − expense, line items ≠ totals, balance roll-forward, abnormal swings
-- **History & trends** — every report is stored in SQLite; browse past reports, delete, and view trend lines
+- **History & trends** — every report is stored; browse past reports, delete, and view trend lines
+
+## Storage
+
+Two backends, chosen automatically:
+
+| Backend | When it is used | Survives redeploy? |
+|---|---|---|
+| **Supabase (Postgres)** | `SUPABASE_URL` and `SUPABASE_KEY` are set | Yes |
+| **SQLite** | otherwise (file at `ACE_DB_PATH`, default `data/ace_audit.db`) | Only on a persistent disk |
+
+Streamlit Community Cloud wipes its filesystem on every reboot, so **use Supabase there** if the
+CEO needs month-over-month history. The sidebar always shows which backend is live.
+
+### Supabase setup (5 minutes)
+
+1. Create a free project at https://supabase.com.
+2. **SQL Editor → New query**, paste [`supabase_schema.sql`](supabase_schema.sql), press Run.
+3. **Project Settings → API**, copy the Project URL and the **`service_role`** key.
+4. Put both in your secrets (see below).
+
+The `service_role` key is used only by the Streamlit server, never sent to the browser. The schema
+enables Row Level Security with no policies, so the table is unreadable to anyone else.
 
 ## Run locally
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-export APP_PASSCODE="your-passcode"
-export GEMINI_API_KEY="your-gemini-key"   # optional, can also be typed in the sidebar
 streamlit run app.py
 ```
 
-Or put both values in `.streamlit/secrets.toml` (see `secrets.toml.example`).
-The database is created automatically at `data/ace_audit.db` (override with `ACE_DB_PATH`).
+Put your settings in `.streamlit/secrets.toml` (see `secrets.toml.example`):
+
+```toml
+APP_PASSCODE   = "your-passcode"
+GEMINI_API_KEY = "your-gemini-key"
+SUPABASE_URL   = ""   # optional
+SUPABASE_KEY   = ""   # optional
+```
+
+Every value must be wrapped in double quotes. Environment variables of the same names also work and
+take precedence.
 
 ## Deploy on Streamlit Community Cloud
 
 1. Push to GitHub, create the app at https://share.streamlit.io (main file `app.py`, Python 3.11).
-2. **App settings → Secrets**:
-
-```toml
-GEMINI_API_KEY = "your-gemini-key"
-APP_PASSCODE   = "your-passcode"
-```
-
-> **Important:** Streamlit Community Cloud's filesystem is ephemeral. The SQLite history is kept
-> while the app is running but is wiped on every redeploy / reboot. For durable history, run the
-> app on a VPS (Docker, systemd) where `data/` is on persistent disk, or point `ACE_DB_PATH` at a
-> mounted volume.
+2. **App settings → Secrets**: paste the same four keys as above, with Supabase filled in.
+3. **App settings → Sharing**: keep it private, or set "Anyone with the link" — the passcode gate
+   still applies either way.
 
 ## Deploy on a VPS
 
@@ -45,4 +66,11 @@ pip install -r requirements.txt
 APP_PASSCODE=... GEMINI_API_KEY=... streamlit run app.py --server.port 8501 --server.address 0.0.0.0
 ```
 
-Put nginx/Caddy in front for HTTPS. Back up `data/ace_audit.db` regularly.
+Put nginx/Caddy in front for HTTPS. On a VPS the SQLite fallback is fine — back up `data/ace_audit.db`.
+
+## Gemini free-tier quota
+
+Google's free tier allows roughly **20 requests per day per model**. One analysis costs three
+requests (two extractions plus the summary), so expect about six analyses per model per day.
+When a model is exhausted the app says so and you can pick another in the sidebar. For regular use,
+enable billing in Google AI Studio.
