@@ -74,8 +74,9 @@ st.markdown(
     padding: 1rem 1.2rem; border: 1px solid rgba(128,128,128,.15); height: 100%;
   }
   .ace-card .label { font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; opacity: .7; }
-  .ace-card .value { font-size: 1.7rem; font-weight: 700; margin: .15rem 0; }
-  .ace-card .delta { font-size: .9rem; font-weight: 600; }
+  .ace-card .value { font-size: clamp(1.05rem, 1.9vw, 1.7rem); font-weight: 700;
+                     margin: .15rem 0; white-space: nowrap; }
+  .ace-card .delta { font-size: clamp(.75rem, 1vw, .9rem); font-weight: 600; white-space: nowrap; }
   .up   { color: #1a9c5b; }
   .down { color: #d63b3b; }
   .flat { color: #888; }
@@ -432,8 +433,9 @@ def metric_card(col, label: str, value: str, delta: float | None, pct: float | N
     if is_missing(delta) or delta == 0:
         cls, arrow = "flat", "•"
     else:
-        good = (delta > 0) != invert
-        cls, arrow = ("up", "▲") if good else ("down", "▼")
+        # Arrow shows the direction of the change; colour shows whether it is good news.
+        arrow = "▲" if delta > 0 else "▼"
+        cls = "up" if ((delta > 0) != invert) else "down"
     if is_missing(delta):
         delta_txt = ""
     elif unit == "pts":
@@ -556,8 +558,7 @@ with st.sidebar:
     language = st.radio("Summary language", ["Myanmar", "English"], horizontal=True)
     threshold = st.slider("Red-flag threshold (% change)", 5.0, 100.0, DEFAULT_ALERT_THRESHOLD, 5.0)
     st.markdown("---")
-    reports = db_list_reports()
-    st.markdown(f"**📚 Stored reports:** {len(reports)}")
+    report_count_slot = st.empty()  # filled at the end so a fresh save is reflected immediately
     st.caption(f"Database: `{DB_PATH}`")
     st.markdown("---")
     if st.button("🔒 Lock dashboard"):
@@ -656,3 +657,6 @@ with tab_trend:
         st.dataframe(trend.style.format({"Income": "{:,.0f}", "Expense": "{:,.0f}",
                                          "Net Profit": "{:,.0f}", "Profit Margin %": "{:.1f}%"}),
                      use_container_width=True, hide_index=True)
+
+# Sidebar report counter is filled last so a report saved in this run is counted.
+report_count_slot.markdown(f"**📚 Stored reports:** {len(db_list_reports())}")
