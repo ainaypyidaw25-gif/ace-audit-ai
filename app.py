@@ -370,8 +370,9 @@ def metric_card(col, label: str, value: str, delta: float | None, pct: float | N
     )
 
 
-def render_report(rec: dict[str, Any]) -> None:
-    """Render a full report (used for both fresh analyses and stored history)."""
+def render_report(rec: dict[str, Any], key_prefix: str) -> None:
+    """Render a full report. `key_prefix` keeps widget keys unique: Streamlit runs every
+    tab in the same script pass, so the same report can be drawn twice in one run."""
     d1, d2, m, alerts = rec["data1"], rec["data2"], rec["metrics"], rec["alerts"]
     l1, l2, cur = rec["label1"], rec["label2"], rec.get("currency") or ""
 
@@ -435,7 +436,7 @@ def render_report(rec: dict[str, Any]) -> None:
     st.download_button("⬇️ Download report (JSON)",
                        data=json.dumps(rec, indent=2, ensure_ascii=False, default=str),
                        file_name=f"ace_report_{rec.get('id', 'new')}.json", mime="application/json",
-                       key=f"dl_{rec.get('id', 'new')}")
+                       key=f"dl_{key_prefix}_{rec.get('id', 'new')}")
 
 
 # =========================================================================== #
@@ -548,7 +549,7 @@ with tab_new:
 
     if "last_report" in st.session_state:
         st.markdown("---")
-        render_report(st.session_state["last_report"])
+        render_report(st.session_state["last_report"], key_prefix="latest")
 
 # --------------------------------------------------------------------------- #
 with tab_history:
@@ -572,7 +573,7 @@ with tab_history:
                 storage.delete_report(rid)
                 st.session_state.pop("last_report", None)
                 st.rerun()
-            render_report(rec)
+            render_report(rec, key_prefix="history")
 
 # --------------------------------------------------------------------------- #
 with tab_trend:
