@@ -17,6 +17,7 @@ from google import genai
 from google.genai import types
 
 from finance import normalize_statement
+from i18n import EN, t
 
 EXTRACTION_SCHEMA = {
     "type": "OBJECT",
@@ -59,6 +60,14 @@ Rules:
 - If a value is genuinely absent use 0 and say so in `notes`.
 - Respond ONLY with JSON matching the schema.
 """
+
+class ExtractionError(ValueError):
+    """Gemini answered, but not with usable JSON for this file."""
+
+    def __init__(self, file_name: str):
+        super().__init__(f"Gemini did not return valid JSON for {file_name}. Try another model.")
+        self.file_name = file_name
+
 
 IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
 
@@ -112,7 +121,7 @@ def extract_financials(api_key: str, model: str, file_bytes: bytes, file_name: s
     try:
         data = json.loads(clean_json(resp.text))
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Gemini did not return valid JSON for {file_name}. Try another model.") from exc
+        raise ExtractionError(file_name) from exc
     return normalize_statement(data)
 
 
@@ -182,19 +191,19 @@ CEO QUESTION: {question.strip()}
     return (resp.text or "").strip()
 
 
-def friendly_error(exc: Exception, model: str) -> str:
-    """Turn a raw Gemini API error into one line a non-engineer can act on."""
+def friendly_error(exc: Exception, model: str, lang: str = EN) -> str:
+    """Turn a raw Gemini API error into one line a non-engineer can act on, in `lang`."""
     msg = str(exc)
+    if isinstance(exc, ExtractionError):
+        return t("err_bad_json", lang, file=exc.file_name)
     if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-        return (f"Daily free-tier quota for **{model}** is used up. Pick a different model in the "
-                "sidebar and try again, or add billing to your Google AI Studio project.")
+        return t("err_quota", lang, model=model)
     if "404" in msg or "NOT_FOUND" in msg:
-        return (f"The model **{model}** is not available to this API key. Choose another model "
-                "in the sidebar.")
+        return t("err_model", lang, model=model)
     if "401" in msg or "403" in msg or "API_KEY" in msg.upper() or "PERMISSION" in msg.upper():
-        return "The Gemini API key was rejected. Check the key in the sidebar or in Secrets."
+        return t("err_key", lang)
     if "DeadlineExceeded" in msg or "timeout" in msg.lower():
-        return "Gemini timed out. Try again, or use a smaller file."
+        return t("err_timeout", lang)
     if isinstance(exc, ValueError):
-        return str(exc)
-    return f"Analysis failed: {msg[:300]}"
+        return msg
+    return t("err_other", lang, error=msg[:300])

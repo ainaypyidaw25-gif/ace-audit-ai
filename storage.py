@@ -75,13 +75,15 @@ def _sb():
     return _client(url, key)
 
 
-def backend_label() -> str:
+def backend_label(lang: str = "en") -> str:
     """Short description for the sidebar."""
+    from i18n import t
+
     if using_supabase():
         url, _ = _supabase_config()
         host = url.replace("https://", "").replace("http://", "").split(".")[0]
-        return f"Supabase · {host} (persistent)"
-    return f"SQLite · {DB_PATH} (wiped on redeploy in the cloud)"
+        return t("storage_supabase", lang, host=host)
+    return t("storage_sqlite", lang, path=DB_PATH)
 
 
 class StorageError(RuntimeError):

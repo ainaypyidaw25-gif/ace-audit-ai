@@ -139,74 +139,85 @@ def _tol(reference: float, rel: float) -> float:
 
 
 def build_alerts(d1: dict, d2: dict, metrics: dict, threshold: float,
-                 label1: str = "Month 1", label2: str = "Month 2") -> list[dict[str, str]]:
-    """Return alerts as {"severity": "error"|"warning"|"info", "message": str}."""
-    alerts: list[dict[str, str]] = []
+                 label1: str = "Month 1", label2: str = "Month 2") -> list[dict[str, Any]]:
+    """Return alerts as {"severity", "code", "params", "message"}.
 
-    def add(sev: str, msg: str) -> None:
-        alerts.append({"severity": sev, "message": msg})
+    `code` and `params` let the UI re-render an alert in any language (see i18n.py);
+    `message` is the English text, kept for Excel export fallbacks and older reports.
+    Numbers in `params` are pre-formatted strings so every language shows the same figures.
+    """
+    from i18n import EN, render_alert  # local import: i18n has no dependencies, avoids cycles
+
+    alerts: list[dict[str, Any]] = []
+
+    def add(sev: str, code: str, **params: Any) -> None:
+        params = {k: str(v) for k, v in params.items()}
+        alerts.append({"severity": sev, "code": code, "params": params,
+                       "message": render_alert(code, params, EN)})
+
+    def money(v: float) -> str:
+        return f"{v:,.0f}"
 
     # Internal consistency of each statement
     for label, d in ((label1, d1), (label2, d2)):
         computed = d["total_income"] - d["total_expense"]
         if abs(computed - d["net_profit"]) > _tol(d["net_profit"], 0.005):
-            add("error", f"{label}: stated net profit {d['net_profit']:,.0f} ≠ income − expense "
-                         f"{computed:,.0f} (gap {d['net_profit'] - computed:,.0f}).")
+            add("error", "net_mismatch", label=label, stated=money(d["net_profit"]),
+                computed=money(computed), gap=money(d["net_profit"] - computed))
         inc_sum = items_to_df(d.get("income_items")).amount.sum()
         exp_sum = items_to_df(d.get("expense_items")).amount.sum()
         if inc_sum and abs(inc_sum - d["total_income"]) > _tol(d["total_income"], 0.01):
-            add("warning", f"{label}: income line items sum to {inc_sum:,.0f} but total income is "
-                           f"{d['total_income']:,.0f}.")
+            add("warning", "income_items_mismatch", label=label, items=money(inc_sum),
+                total=money(d["total_income"]))
         if exp_sum and abs(exp_sum - d["total_expense"]) > _tol(d["total_expense"], 0.01):
-            add("warning", f"{label}: expense line items sum to {exp_sum:,.0f} but total expense is "
-                           f"{d['total_expense']:,.0f}.")
+            add("warning", "expense_items_mismatch", label=label, items=money(exp_sum),
+                total=money(d["total_expense"]))
         ob, cb = d.get("opening_balance") or 0, d.get("closing_balance") or 0
         if (ob or cb) and abs(ob + d["net_profit"] - cb) > _tol(cb, 0.005):
-            add("warning", f"{label}: opening + net profit = {ob + d['net_profit']:,.0f} but closing "
-                           f"balance is {cb:,.0f}.")
+            add("warning", "balance_rollforward", label=label, expected=money(ob + d["net_profit"]),
+                closing=money(cb))
 
     # Continuity between the two statements
     cb1, ob2 = d1.get("closing_balance") or 0, d2.get("opening_balance") or 0
     if cb1 and ob2 and abs(cb1 - ob2) > _tol(cb1, 0.005):
-        add("error", f"{label1} closing balance {cb1:,.0f} ≠ {label2} opening balance {ob2:,.0f}.")
+        add("error", "balance_break", label1=label1, label2=label2, closing=money(cb1), opening=money(ob2))
 
     c1 = (d1.get("currency") or "").strip().upper()
     c2 = (d2.get("currency") or "").strip().upper()
     if c1 and c2 and c1 != c2:
-        add("warning", f"Currency differs: {d1.get('currency')} vs {d2.get('currency')}. "
-                       "Comparisons are not meaningful until both use the same currency.")
+        add("warning", "currency_mismatch", c1=d1.get("currency"), c2=d2.get("currency"))
 
     # Abnormal swings
-    for key, name in (("total_income", "Total income"), ("total_expense", "Total expense"),
-                      ("net_profit", "Net profit")):
+    for key in ("total_income", "total_expense", "net_profit"):
         ch = pct_change(d1[key], d2[key])
         if ch is not None and abs(ch) >= threshold:
-            add("warning", f"{name} changed {ch:+.1f}% (threshold {threshold:.0f}%).")
+            add("warning", "total_swing", metric=key, change=f"{ch:+.1f}%", threshold=f"{threshold:.0f}")
 
     if d2["net_profit"] < 0:
-        add("error", f"{label2} shows a NET LOSS of {d2['net_profit']:,.0f}.")
+        add("error", "net_loss", label=label2, amount=money(d2["net_profit"]))
     exp_growth = pct_change(d1["total_expense"], d2["total_expense"])
     inc_growth = pct_change(d1["total_income"], d2["total_income"])
     if exp_growth is not None and inc_growth is not None and exp_growth > inc_growth + 10:
-        add("warning", f"Expenses grew faster than income ({exp_growth:+.1f}% vs {inc_growth:+.1f}%).")
+        add("warning", "expense_outpaces_income", exp=f"{exp_growth:+.1f}%", inc=f"{inc_growth:+.1f}%")
 
-    for rows, kind in ((metrics["income_by_category"], "Income"),
-                       (metrics["expense_by_category"], "Expense")):
+    for rows, kind in ((metrics["income_by_category"], "income"),
+                       (metrics["expense_by_category"], "expense")):
         for r in rows:
             ch = r["Change %"]
             if not is_missing(ch) and abs(ch) >= threshold:
                 if r[label2] == 0:
-                    add("info", f"{kind} '{r['category']}' disappeared in {label2} "
-                                f"(was {r[label1]:,.0f}).")
+                    add("info", "category_gone", kind=kind, category=r["category"], label=label2,
+                        was=money(r[label1]))
                 else:
-                    add("info", f"{kind} '{r['category']}' changed {ch:+.1f}%.")
+                    add("info", "category_swing", kind=kind, category=r["category"], change=f"{ch:+.1f}%")
             elif is_missing(ch) and r["Difference"] != 0:
-                add("info", f"{kind} '{r['category']}' is new in {label2} ({r[label2]:,.0f}).")
+                add("info", "category_new", kind=kind, category=r["category"], label=label2,
+                    amount=money(r[label2]))
 
     for label, d in ((label1, d1), (label2, d2)):
         note = (d.get("notes") or "").strip()
         if note and note.lower() not in {"none", "n/a", "no anomalies"}:
-            add("info", f"{label} AI notes: {note}")
+            add("info", "ai_note", label=label, note=note)
     return alerts
 
 

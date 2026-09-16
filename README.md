@@ -3,6 +3,7 @@
 Single-user (CEO) Streamlit app that compares two monthly financial statements with Google Gemini
 and keeps a persistent history of every analysis.
 
+- **Myanmar and English** — the whole interface, alerts, AI answers and Excel export; Myanmar by default
 - **Passcode gate** — one shared passcode (`APP_PASSCODE`), no accounts
 - **AI extraction** — PDF / PNG / JPG / WEBP / XLSX / XLS / CSV → income, expenses, net profit, balances, line items
 - **Calculations** — totals, net variance, growth rate %, profit margin %, expense ratio, multiples
@@ -17,6 +18,7 @@ and keeps a persistent history of every analysis.
 | File | Responsibility |
 |---|---|
 | `app.py` | Streamlit UI only |
+| `i18n.py` | Myanmar / English interface text |
 | `finance.py` | Calculations and alerts — pure functions |
 | `ai.py` | Gemini extraction, CEO summary, report Q&A |
 | `export.py` | Excel workbook export |
