@@ -8,7 +8,30 @@ and keeps a persistent history of every analysis.
 - **Calculations** — totals, net variance, growth rate %, profit margin %, expense ratio, multiples
 - **CEO Quick Summary** — Gemini writes bullet-point insights with 🔴 red flags (Myanmar or English)
 - **Discrepancy alerts** — net ≠ income − expense, line items ≠ totals, balance roll-forward, abnormal swings
-- **History & trends** — every report is stored; browse past reports, delete, and view trend lines
+- **Ask about a report** — follow-up questions answered by Gemini from that report's data only
+- **Excel export** — Summary, Totals, Ratios, Income, Expenses and Alerts sheets with real numbers
+- **History & trends** — every report is stored; browse, delete (with confirmation), view trend lines
+
+## Project layout
+
+| File | Responsibility |
+|---|---|
+| `app.py` | Streamlit UI only |
+| `finance.py` | Calculations and alerts — pure functions |
+| `ai.py` | Gemini extraction, CEO summary, report Q&A |
+| `export.py` | Excel workbook export |
+| `storage.py` | Supabase / SQLite persistence |
+| `tests/` | pytest suite, including headless UI tests |
+
+## Tests
+
+```bash
+pip install pytest
+python -m pytest -q
+```
+
+The suite needs no API key and makes no network calls: Gemini is replaced by fake clients,
+storage uses a temporary SQLite file, and the UI runs headless through `streamlit.testing`.
 
 ## Storage
 

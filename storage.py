@@ -30,6 +30,8 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from finance import display_period
+
 DB_PATH = Path(os.environ.get("ACE_DB_PATH", "data/ace_audit.db"))
 TABLE = "reports"
 
@@ -228,7 +230,7 @@ def trend_frame() -> pd.DataFrame:
         out.append({
             "Report #": r["id"],
             "Saved": str(r.get("created_at") or "")[:16],
-            "Period": r.get("period2") or r.get("title"),
+            "Period": display_period(r.get("period2"), r.get("title") or f"Report {r['id']}"),
             "Income": float(d.get("total_income") or 0),
             "Expense": float(d.get("total_expense") or 0),
             "Net Profit": float(d.get("net_profit") or 0),
