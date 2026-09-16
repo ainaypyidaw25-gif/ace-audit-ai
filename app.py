@@ -1,22 +1,26 @@
 """
-ACE Audit AI - Financial Statement Comparison with Google Gemini
-=================================================================
-Streamlit web app that:
-  1. Accepts two monthly financial statement files (PDF / image / Excel / CSV)
-  2. Uses Google Gemini to extract structured financial figures
-  3. Compares the two months (totals, net difference, growth %, ratios)
-  4. Flags discrepancies and abnormal changes
+ACE Audit AI - Executive Financial Comparison Dashboard (single-user)
+=====================================================================
+- Passcode gate (one CEO user)
+- Gemini extracts figures from PDF / image / Excel / CSV statements
+- Add / subtract / multiply / divide comparisons + red-flag alerts
+- Gemini writes a CEO bullet-point summary
+- Every analysis is stored in SQLite (history + trend viewer)
 
-Run locally:   streamlit run app.py
-Deploy:        Streamlit Cloud (main file = app.py) or any server with Python 3.9+
+Run:     streamlit run app.py
+Config:  APP_PASSCODE, GEMINI_API_KEY via env vars or .streamlit/secrets.toml
 """
 
 from __future__ import annotations
 
+import hmac
 import io
 import json
 import os
 import re
+import sqlite3
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -24,169 +28,288 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-# --------------------------------------------------------------------------- #
-# Page config
-# --------------------------------------------------------------------------- #
+# =========================================================================== #
+# Configuration
+# =========================================================================== #
 st.set_page_config(
-    page_title="ACE Audit AI - ငွေစာရင်း နှိုင်းယှဉ်စစ်ဆေးရေး",
+    page_title="ACE Audit AI - Executive Dashboard",
     page_icon="📊",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-DEFAULT_MODEL = "gemini-2.5-flash"
 MODEL_OPTIONS = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
-
-# Threshold (in %) above which a change is flagged as abnormal
 DEFAULT_ALERT_THRESHOLD = 30.0
+DB_PATH = Path(os.environ.get("ACE_DB_PATH", "data/ace_audit.db"))
+ACCEPTED_TYPES = ["pdf", "png", "jpg", "jpeg", "webp", "xlsx", "xls", "csv"]
 
-# --------------------------------------------------------------------------- #
-# Gemini extraction schema & prompt
-# --------------------------------------------------------------------------- #
+
+def secret(name: str, default: str = "") -> str:
+    """Read from env first, then st.secrets (which may not exist locally)."""
+    val = os.environ.get(name, "")
+    if val:
+        return val
+    try:
+        return str(st.secrets.get(name, default))
+    except Exception:  # noqa: BLE001 - no secrets.toml locally
+        return default
+
+
+# =========================================================================== #
+# Styling - clean executive look
+# =========================================================================== #
+st.markdown(
+    """
+<style>
+  .block-container { padding-top: 1.5rem; max-width: 1300px; }
+  h1, h2, h3 { letter-spacing: -0.01em; }
+  .ace-hero {
+    background: linear-gradient(135deg, #0f2a4a 0%, #1f6feb 100%);
+    color: #fff; border-radius: 14px; padding: 1.4rem 1.8rem; margin-bottom: 1.2rem;
+  }
+  .ace-hero h1 { color: #fff; margin: 0; font-size: 1.9rem; }
+  .ace-hero p  { margin: .3rem 0 0; opacity: .9; }
+  .ace-card {
+    background: var(--secondary-background-color); border-radius: 12px;
+    padding: 1rem 1.2rem; border: 1px solid rgba(128,128,128,.15); height: 100%;
+  }
+  .ace-card .label { font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; opacity: .7; }
+  .ace-card .value { font-size: 1.7rem; font-weight: 700; margin: .15rem 0; }
+  .ace-card .delta { font-size: .9rem; font-weight: 600; }
+  .up   { color: #1a9c5b; }
+  .down { color: #d63b3b; }
+  .flat { color: #888; }
+  .ace-summary { background: rgba(31,111,235,.06); border-left: 4px solid #1f6feb;
+                 border-radius: 8px; padding: 1rem 1.2rem; }
+  div[data-testid="stSidebar"] .stButton button { width: 100%; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# =========================================================================== #
+# Database (SQLite) - persistent history
+# =========================================================================== #
+def db_connect() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reports (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at   TEXT NOT NULL,
+            title        TEXT NOT NULL,
+            label1       TEXT, label2 TEXT,
+            period1      TEXT, period2 TEXT,
+            currency     TEXT,
+            file1_name   TEXT, file2_name TEXT,
+            model        TEXT,
+            data1_json   TEXT NOT NULL,
+            data2_json   TEXT NOT NULL,
+            metrics_json TEXT NOT NULL,
+            alerts_json  TEXT NOT NULL,
+            summary      TEXT
+        )
+        """
+    )
+    return conn
+
+
+def db_save_report(rec: dict[str, Any]) -> int:
+    with db_connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO reports (created_at, title, label1, label2, period1, period2, currency,
+                                 file1_name, file2_name, model, data1_json, data2_json,
+                                 metrics_json, alerts_json, summary)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                rec["created_at"], rec["title"], rec["label1"], rec["label2"],
+                rec["period1"], rec["period2"], rec["currency"],
+                rec["file1_name"], rec["file2_name"], rec["model"],
+                json.dumps(rec["data1"], ensure_ascii=False),
+                json.dumps(rec["data2"], ensure_ascii=False),
+                json.dumps(rec["metrics"], ensure_ascii=False, default=str),
+                json.dumps(rec["alerts"], ensure_ascii=False),
+                rec["summary"],
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def db_list_reports() -> list[sqlite3.Row]:
+    with db_connect() as conn:
+        return conn.execute(
+            "SELECT id, created_at, title, period1, period2, currency FROM reports ORDER BY id DESC"
+        ).fetchall()
+
+
+def db_get_report(report_id: int) -> dict[str, Any] | None:
+    with db_connect() as conn:
+        row = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+    if not row:
+        return None
+    rec = dict(row)
+    rec["data1"] = json.loads(rec.pop("data1_json"))
+    rec["data2"] = json.loads(rec.pop("data2_json"))
+    rec["metrics"] = json.loads(rec.pop("metrics_json"))
+    rec["alerts"] = json.loads(rec.pop("alerts_json"))
+    return rec
+
+
+def db_delete_report(report_id: int) -> None:
+    with db_connect() as conn:
+        conn.execute("DELETE FROM reports WHERE id = ?", (report_id,))
+
+
+def db_trend_frame() -> pd.DataFrame:
+    """One row per stored report using the *Month 2* (current) figures for trend lines."""
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT id, created_at, title, period2, data2_json FROM reports ORDER BY id ASC"
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = json.loads(r["data2_json"])
+        out.append({
+            "Report #": r["id"],
+            "Saved": r["created_at"][:16],
+            "Period": r["period2"] or r["title"],
+            "Income": float(d.get("total_income") or 0),
+            "Expense": float(d.get("total_expense") or 0),
+            "Net Profit": float(d.get("net_profit") or 0),
+        })
+    return pd.DataFrame(out)
+
+
+# =========================================================================== #
+# Gemini - extraction
+# =========================================================================== #
 EXTRACTION_SCHEMA = {
     "type": "OBJECT",
     "properties": {
         "period": {"type": "STRING", "description": "Statement period, e.g. 'January 2026'"},
         "currency": {"type": "STRING", "description": "Currency code or symbol, e.g. MMK, USD"},
-        "total_income": {"type": "NUMBER", "description": "Total income / revenue for the period"},
-        "total_expense": {"type": "NUMBER", "description": "Total expenses for the period"},
-        "net_profit": {"type": "NUMBER", "description": "Net profit or loss (income - expense)"},
-        "opening_balance": {"type": "NUMBER", "description": "Opening / beginning balance, 0 if not present"},
-        "closing_balance": {"type": "NUMBER", "description": "Closing / ending balance, 0 if not present"},
+        "total_income": {"type": "NUMBER"},
+        "total_expense": {"type": "NUMBER"},
+        "net_profit": {"type": "NUMBER", "description": "Net profit/loss as stated in the document"},
+        "opening_balance": {"type": "NUMBER", "description": "0 if absent"},
+        "closing_balance": {"type": "NUMBER", "description": "0 if absent"},
         "income_items": {
             "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "properties": {
-                    "category": {"type": "STRING"},
-                    "amount": {"type": "NUMBER"},
-                },
-                "required": ["category", "amount"],
-            },
+            "items": {"type": "OBJECT",
+                      "properties": {"category": {"type": "STRING"}, "amount": {"type": "NUMBER"}},
+                      "required": ["category", "amount"]},
         },
         "expense_items": {
             "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "properties": {
-                    "category": {"type": "STRING"},
-                    "amount": {"type": "NUMBER"},
-                },
-                "required": ["category", "amount"],
-            },
+            "items": {"type": "OBJECT",
+                      "properties": {"category": {"type": "STRING"}, "amount": {"type": "NUMBER"}},
+                      "required": ["category", "amount"]},
         },
-        "notes": {"type": "STRING", "description": "Any anomalies, unclear figures or assumptions made"},
+        "notes": {"type": "STRING", "description": "Anomalies, unclear figures, assumptions"},
     },
-    "required": [
-        "period",
-        "currency",
-        "total_income",
-        "total_expense",
-        "net_profit",
-        "income_items",
-        "expense_items",
-    ],
+    "required": ["period", "currency", "total_income", "total_expense", "net_profit",
+                 "income_items", "expense_items"],
 }
 
 EXTRACTION_PROMPT = """You are a meticulous accountant. Read the attached financial statement
-(it may be a PDF, a scanned image, or tabular data) and extract the figures.
+(PDF, scanned image, or tabular data) and extract the figures.
 
 Rules:
-- All amounts must be plain numbers (no thousands separators, no currency symbols).
+- Amounts are plain numbers: no thousands separators, no currency symbols.
 - Expenses are positive numbers.
-- net_profit = total_income - total_expense. If the document states a different net figure,
-  still report the document's stated value and mention the mismatch in `notes`.
-- Group line items into sensible categories (e.g. Sales, Service Income, Rent, Salaries, Utilities).
-- If a value is genuinely absent, use 0 and explain in `notes`.
-- Respond ONLY with JSON matching the given schema.
+- net_profit should equal total_income - total_expense. If the document states a different
+  figure, report the document's figure and explain the mismatch in `notes`.
+- Group line items into sensible categories (Sales, Service Income, Rent, Salaries, Utilities...).
+- If a value is genuinely absent use 0 and say so in `notes`.
+- Respond ONLY with JSON matching the schema.
 """
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
-def get_client(api_key: str) -> genai.Client:
-    return genai.Client(api_key=api_key)
 
-
-def file_to_part(uploaded) -> tuple[types.Part | str, str]:
-    """
-    Convert an uploaded file into a Gemini content part.
-    Returns (part, description). Excel/CSV are converted to CSV text so Gemini
-    reads exact numbers instead of guessing from a rendered image.
-    """
-    name = uploaded.name.lower()
-    data = uploaded.getvalue()
-
-    if name.endswith(".pdf"):
-        return types.Part.from_bytes(data=data, mime_type="application/pdf"), "PDF"
-
-    if name.endswith((".png", ".jpg", ".jpeg", ".webp")):
-        mime = "image/png" if name.endswith(".png") else "image/webp" if name.endswith(".webp") else "image/jpeg"
-        return types.Part.from_bytes(data=data, mime_type=mime), "Image"
-
-    if name.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(data))
-        return f"CSV data:\n\n{df.to_csv(index=False)}", "CSV"
-
-    if name.endswith((".xlsx", ".xls")):
+def file_to_part(name: str, data: bytes):
+    n = name.lower()
+    if n.endswith(".pdf"):
+        return types.Part.from_bytes(data=data, mime_type="application/pdf")
+    if n.endswith((".png", ".jpg", ".jpeg", ".webp")):
+        mime = "image/png" if n.endswith(".png") else "image/webp" if n.endswith(".webp") else "image/jpeg"
+        return types.Part.from_bytes(data=data, mime_type=mime)
+    if n.endswith(".csv"):
+        return "CSV data:\n\n" + pd.read_csv(io.BytesIO(data)).to_csv(index=False)
+    if n.endswith((".xlsx", ".xls")):
         sheets = pd.read_excel(io.BytesIO(data), sheet_name=None)
-        chunks = [f"### Sheet: {sn}\n{df.to_csv(index=False)}" for sn, df in sheets.items()]
-        return "Excel workbook data:\n\n" + "\n\n".join(chunks), "Excel"
-
-    raise ValueError(f"Unsupported file type: {uploaded.name}")
+        return "Excel workbook:\n\n" + "\n\n".join(
+            f"### Sheet: {sn}\n{df.to_csv(index=False)}" for sn, df in sheets.items())
+    raise ValueError(f"Unsupported file type: {name}")
 
 
 def _clean_json(text: str) -> str:
-    """Strip markdown fences if the model wraps JSON in ```json ... ```."""
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    return text
+    return re.sub(r"\s*```$", "", text)
 
 
 @st.cache_data(show_spinner=False)
 def extract_financials(api_key: str, model: str, file_bytes: bytes, file_name: str) -> dict[str, Any]:
-    """Send one file to Gemini and return the structured extraction. Cached per file content."""
-    client = get_client(api_key)
-
-    class _Wrapper:  # minimal shim so file_to_part can reuse UploadedFile API
-        name = file_name
-
-        @staticmethod
-        def getvalue() -> bytes:
-            return file_bytes
-
-    part, _ = file_to_part(_Wrapper())
-
-    response = client.models.generate_content(
+    client = genai.Client(api_key=api_key)
+    resp = client.models.generate_content(
         model=model,
-        contents=[EXTRACTION_PROMPT, part],
+        contents=[EXTRACTION_PROMPT, file_to_part(file_name, file_bytes)],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=EXTRACTION_SCHEMA,
             temperature=0.0,
         ),
     )
-    return json.loads(_clean_json(response.text))
+    d = json.loads(_clean_json(resp.text))
+    for k in ("total_income", "total_expense", "net_profit", "opening_balance", "closing_balance"):
+        d[k] = float(d.get(k) or 0)
+    return d
 
 
+def generate_ceo_summary(api_key: str, model: str, payload: dict[str, Any], language: str) -> str:
+    """Second Gemini call: turn the computed metrics + alerts into a CEO briefing."""
+    lang_line = ("Write in Burmese (Myanmar language), keeping financial terms in English in brackets."
+                 if language == "Myanmar" else "Write in clear business English.")
+    prompt = f"""You are the CFO briefing the CEO. Using ONLY the data below, write a concise executive
+summary as Markdown bullet points (5-8 bullets). Cover: overall performance, biggest drivers of
+change, cost concerns, and clear RED FLAGS (mark with 🔴). End with one line of recommended action.
+Do not invent numbers. {lang_line}
+
+DATA:
+{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}
+"""
+    client = genai.Client(api_key=api_key)
+    resp = client.models.generate_content(
+        model=model, contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.3),
+    )
+    return (resp.text or "").strip()
+
+
+# =========================================================================== #
+# Calculations
+# =========================================================================== #
 def pct_change(old: float, new: float) -> float | None:
-    if old == 0:
-        return None
-    return (new - old) / abs(old) * 100.0
+    return None if old == 0 else (new - old) / abs(old) * 100.0
 
 
-def safe_ratio(num: float, den: float) -> float | None:
-    return None if den == 0 else num / den
+def safe_div(a: float, b: float) -> float | None:
+    return None if b == 0 else a / b
+
+
+def is_missing(v) -> bool:
+    return v is None or (isinstance(v, float) and pd.isna(v))
 
 
 def fmt_money(v: float | None, cur: str = "") -> str:
-    if v is None:
-        return "-"
-    return f"{v:,.0f} {cur}".strip()
+    return "-" if is_missing(v) else f"{v:,.0f} {cur}".strip()
 
 
 def fmt_pct(v: float | None) -> str:
-    return "-" if v is None or pd.isna(v) else f"{v:+.1f}%"
+    return "-" if is_missing(v) else f"{v:+.1f}%"
 
 
 def items_to_df(items: list[dict]) -> pd.DataFrame:
@@ -195,305 +318,341 @@ def items_to_df(items: list[dict]) -> pd.DataFrame:
     return df.groupby("category", as_index=False)["amount"].sum()
 
 
-def compare_items(items1: list[dict], items2: list[dict], label1: str, label2: str) -> pd.DataFrame:
+def compare_items(items1, items2, label1: str, label2: str) -> pd.DataFrame:
     df1 = items_to_df(items1).rename(columns={"amount": label1})
     df2 = items_to_df(items2).rename(columns={"amount": label2})
-    merged = df1.merge(df2, on="category", how="outer").fillna(0.0)
-    merged["Difference"] = merged[label2] - merged[label1]
-    merged["Change %"] = merged.apply(lambda r: pct_change(r[label1], r[label2]), axis=1)
-    return merged.sort_values(label2, ascending=False).reset_index(drop=True)
+    m = df1.merge(df2, on="category", how="outer").fillna(0.0)
+    m["Difference"] = m[label2] - m[label1]
+    m["Change %"] = m.apply(lambda r: pct_change(r[label1], r[label2]), axis=1)
+    return m.sort_values(label2, ascending=False).reset_index(drop=True)
 
 
-def build_alerts(d1: dict, d2: dict, item_cmp_income: pd.DataFrame, item_cmp_expense: pd.DataFrame,
-                 threshold: float) -> list[tuple[str, str]]:
-    """Return list of (severity, message). severity in {'error','warning','info'}."""
-    alerts: list[tuple[str, str]] = []
+def compute_metrics(d1: dict, d2: dict, label1: str, label2: str) -> dict[str, Any]:
+    totals = []
+    for key, name in (("opening_balance", "Opening Balance"), ("total_income", "Total Income"),
+                      ("total_expense", "Total Expense"), ("net_profit", "Net Profit"),
+                      ("closing_balance", "Closing Balance")):
+        totals.append({"Item": name, label1: d1[key], label2: d2[key],
+                       "Net Variance": d2[key] - d1[key], "Combined": d1[key] + d2[key],
+                       "Change %": pct_change(d1[key], d2[key])})
 
-    # 1. Internal consistency: income - expense should equal net_profit
+    def r(v, unit):
+        return None if is_missing(v) else (v * 100 if unit == "%" else v)
+
+    ratios = [
+        {"Metric": "Income growth rate", "unit": "%", label1: None,
+         label2: pct_change(d1["total_income"], d2["total_income"])},
+        {"Metric": "Expense growth rate", "unit": "%", label1: None,
+         label2: pct_change(d1["total_expense"], d2["total_expense"])},
+        {"Metric": "Net profit growth rate", "unit": "%", label1: None,
+         label2: pct_change(d1["net_profit"], d2["net_profit"])},
+        {"Metric": "Profit margin (net / income)", "unit": "%",
+         label1: r(safe_div(d1["net_profit"], d1["total_income"]), "%"),
+         label2: r(safe_div(d2["net_profit"], d2["total_income"]), "%")},
+        {"Metric": "Expense ratio (expense / income)", "unit": "%",
+         label1: r(safe_div(d1["total_expense"], d1["total_income"]), "%"),
+         label2: r(safe_div(d2["total_expense"], d2["total_income"]), "%")},
+        {"Metric": "Income / Expense multiple", "unit": "x",
+         label1: safe_div(d1["total_income"], d1["total_expense"]),
+         label2: safe_div(d2["total_income"], d2["total_expense"])},
+        {"Metric": "Income multiplier (M2 / M1)", "unit": "x", label1: None,
+         label2: safe_div(d2["total_income"], d1["total_income"])},
+    ]
+    inc = compare_items(d1.get("income_items", []), d2.get("income_items", []), label1, label2)
+    exp = compare_items(d1.get("expense_items", []), d2.get("expense_items", []), label1, label2)
+    return {"totals": totals, "ratios": ratios,
+            "income_by_category": inc.to_dict(orient="records"),
+            "expense_by_category": exp.to_dict(orient="records")}
+
+
+def build_alerts(d1: dict, d2: dict, metrics: dict, threshold: float) -> list[dict[str, str]]:
+    alerts: list[dict[str, str]] = []
+
+    def add(sev, msg):
+        alerts.append({"severity": sev, "message": msg})
+
     for label, d in (("Month 1", d1), ("Month 2", d2)):
         computed = d["total_income"] - d["total_expense"]
-        stated = d["net_profit"]
-        if abs(computed - stated) > max(1.0, abs(stated) * 0.005):
-            alerts.append((
-                "error",
-                f"{label}: Net profit stated ({stated:,.0f}) does not equal income - expense "
-                f"({computed:,.0f}). Difference = {stated - computed:,.0f}.",
-            ))
-
-        # 2. Line items should sum to the totals
+        if abs(computed - d["net_profit"]) > max(1.0, abs(d["net_profit"]) * 0.005):
+            add("error", f"{label}: stated net profit {d['net_profit']:,.0f} ≠ income − expense "
+                         f"{computed:,.0f} (gap {d['net_profit'] - computed:,.0f}).")
         inc_sum = items_to_df(d.get("income_items", []))["amount"].sum()
         exp_sum = items_to_df(d.get("expense_items", []))["amount"].sum()
         if inc_sum and abs(inc_sum - d["total_income"]) > max(1.0, abs(d["total_income"]) * 0.01):
-            alerts.append((
-                "warning",
-                f"{label}: Income line items sum to {inc_sum:,.0f} but total income is "
-                f"{d['total_income']:,.0f}.",
-            ))
+            add("warning", f"{label}: income line items sum to {inc_sum:,.0f} but total income is "
+                           f"{d['total_income']:,.0f}.")
         if exp_sum and abs(exp_sum - d["total_expense"]) > max(1.0, abs(d["total_expense"]) * 0.01):
-            alerts.append((
-                "warning",
-                f"{label}: Expense line items sum to {exp_sum:,.0f} but total expense is "
-                f"{d['total_expense']:,.0f}.",
-            ))
-
-        # 3. Balance roll-forward check (only if balances present)
+            add("warning", f"{label}: expense line items sum to {exp_sum:,.0f} but total expense is "
+                           f"{d['total_expense']:,.0f}.")
         ob, cb = d.get("opening_balance", 0) or 0, d.get("closing_balance", 0) or 0
-        if ob or cb:
-            expected_cb = ob + stated
-            if abs(expected_cb - cb) > max(1.0, abs(cb) * 0.005):
-                alerts.append((
-                    "warning",
-                    f"{label}: Opening balance + net profit = {expected_cb:,.0f} but closing balance "
-                    f"is {cb:,.0f}.",
-                ))
+        if (ob or cb) and abs(ob + d["net_profit"] - cb) > max(1.0, abs(cb) * 0.005):
+            add("warning", f"{label}: opening + net profit = {ob + d['net_profit']:,.0f} but closing "
+                           f"balance is {cb:,.0f}.")
 
-    # 4. Month 1 closing should equal Month 2 opening
-    cb1 = d1.get("closing_balance", 0) or 0
-    ob2 = d2.get("opening_balance", 0) or 0
+    cb1, ob2 = d1.get("closing_balance", 0) or 0, d2.get("opening_balance", 0) or 0
     if cb1 and ob2 and abs(cb1 - ob2) > max(1.0, abs(cb1) * 0.005):
-        alerts.append((
-            "error",
-            f"Month 1 closing balance ({cb1:,.0f}) does not match Month 2 opening balance ({ob2:,.0f}).",
-        ))
+        add("error", f"Month 1 closing balance {cb1:,.0f} ≠ Month 2 opening balance {ob2:,.0f}.")
 
-    # 5. Currency mismatch
     if (d1.get("currency") or "").strip().upper() != (d2.get("currency") or "").strip().upper():
-        alerts.append(("warning", f"Currency differs: Month 1 = {d1.get('currency')}, Month 2 = {d2.get('currency')}."))
+        add("warning", f"Currency differs: {d1.get('currency')} vs {d2.get('currency')}.")
 
-    # 6. Abnormal swings on totals
-    for key, name in (("total_income", "Total income"), ("total_expense", "Total expense"), ("net_profit", "Net profit")):
+    for key, name in (("total_income", "Total income"), ("total_expense", "Total expense"),
+                      ("net_profit", "Net profit")):
         ch = pct_change(d1[key], d2[key])
         if ch is not None and abs(ch) >= threshold:
-            alerts.append(("warning", f"{name} changed by {ch:+.1f}% (threshold {threshold:.0f}%)."))
+            add("warning", f"{name} changed {ch:+.1f}% (threshold {threshold:.0f}%).")
 
-    # 7. Loss
     if d2["net_profit"] < 0:
-        alerts.append(("error", f"Month 2 shows a net LOSS of {d2['net_profit']:,.0f}."))
+        add("error", f"Month 2 shows a NET LOSS of {d2['net_profit']:,.0f}.")
+    exp_growth = pct_change(d1["total_expense"], d2["total_expense"])
+    inc_growth = pct_change(d1["total_income"], d2["total_income"])
+    if exp_growth is not None and inc_growth is not None and exp_growth > inc_growth + 10:
+        add("warning", f"Expenses grew faster than income ({exp_growth:+.1f}% vs {inc_growth:+.1f}%).")
 
-    # 8. Abnormal swings on individual categories
-    for df, kind in ((item_cmp_income, "Income"), (item_cmp_expense, "Expense")):
-        for _, r in df.iterrows():
+    for rows, kind in ((metrics["income_by_category"], "Income"), (metrics["expense_by_category"], "Expense")):
+        for r in rows:
             ch = r["Change %"]
-            missing = ch is None or pd.isna(ch)
-            if not missing and abs(ch) >= threshold:
-                alerts.append(("info", f"{kind} category '{r['category']}' changed by {ch:+.1f}%."))
-            elif missing and r["Difference"] != 0:
-                alerts.append(("info", f"{kind} category '{r['category']}' is new or disappeared (diff {r['Difference']:,.0f})."))
+            if not is_missing(ch) and abs(ch) >= threshold:
+                add("info", f"{kind} '{r['category']}' changed {ch:+.1f}%.")
+            elif is_missing(ch) and r["Difference"] != 0:
+                add("info", f"{kind} '{r['category']}' is new or disappeared (Δ {r['Difference']:,.0f}).")
 
-    # 9. Model-reported notes
     for label, d in (("Month 1", d1), ("Month 2", d2)):
         note = (d.get("notes") or "").strip()
-        if note and note.lower() not in {"none", "n/a", "no anomalies"}:
-            alerts.append(("info", f"{label} AI notes: {note}"))
-
+        if note and note.lower() not in {"none", "n/a", "no anomalies", ""}:
+            add("info", f"{label} AI notes: {note}")
     return alerts
 
 
-# --------------------------------------------------------------------------- #
-# Sidebar - settings
-# --------------------------------------------------------------------------- #
-with st.sidebar:
-    st.header("⚙️ Settings")
-    api_key = st.text_input(
-        "Google Gemini API Key",
-        type="password",
-        value=os.environ.get("GEMINI_API_KEY", ""),
-        help="Get a key at https://aistudio.google.com/app/apikey. "
-             "On Streamlit Cloud you can also set GEMINI_API_KEY in Secrets.",
-    )
-    if not api_key:
-        try:  # st.secrets raises if no secrets.toml exists locally
-            api_key = st.secrets.get("GEMINI_API_KEY", "")
-        except Exception:  # noqa: BLE001
-            api_key = ""
-
-    model = st.selectbox("Gemini model", MODEL_OPTIONS, index=0)
-    threshold = st.slider("Alert threshold (% change)", 5.0, 100.0, DEFAULT_ALERT_THRESHOLD, 5.0)
-
-    st.markdown("---")
-    st.caption(
-        "Supported files: PDF, PNG/JPG/WEBP, XLSX/XLS, CSV.\n\n"
-        "Files are sent to Google Gemini for extraction. Do not upload data you are not "
-        "allowed to share with a third-party service."
+# =========================================================================== #
+# UI helpers
+# =========================================================================== #
+def metric_card(col, label: str, value: str, delta: float | None, pct: float | None,
+                invert: bool = False, unit: str = "money") -> None:
+    if is_missing(delta) or delta == 0:
+        cls, arrow = "flat", "•"
+    else:
+        good = (delta > 0) != invert
+        cls, arrow = ("up", "▲") if good else ("down", "▼")
+    if is_missing(delta):
+        delta_txt = ""
+    elif unit == "pts":
+        delta_txt = f"{arrow} {delta:+.1f} pts"
+    else:
+        delta_txt = f"{arrow} {delta:+,.0f} ({fmt_pct(pct)})"
+    col.markdown(
+        f'<div class="ace-card"><div class="label">{label}</div>'
+        f'<div class="value">{value}</div><div class="delta {cls}">{delta_txt}</div></div>',
+        unsafe_allow_html=True,
     )
 
-# --------------------------------------------------------------------------- #
-# Main UI
-# --------------------------------------------------------------------------- #
-st.title("📊 ACE Audit AI")
-st.subheader("လစဉ် ငွေစာရင်း နှိုင်းယှဉ်စစ်ဆေးရေး (Gemini AI)")
-st.write(
-    "လနှစ်လ၏ ငွေစာရင်းဖိုင်များကို တင်ပါ။ AI က ဝင်ငွေ၊ ထွက်ငွေ၊ အမြတ် စသည်တို့ကို ဖတ်ယူပြီး "
-    "ကွာခြားချက်၊ တိုးတက်နှုန်း၊ အချိုးများနှင့် သတိပေးချက်များကို တွက်ချက်ဖော်ပြပေးပါမည်။"
-)
 
-ACCEPTED = ["pdf", "png", "jpg", "jpeg", "webp", "xlsx", "xls", "csv"]
-col1, col2 = st.columns(2)
-with col1:
-    label1 = st.text_input("Month 1 label", "Month 1")
-    file1 = st.file_uploader("Upload Month 1 statement", type=ACCEPTED, key="f1")
-with col2:
-    label2 = st.text_input("Month 2 label", "Month 2")
-    file2 = st.file_uploader("Upload Month 2 statement", type=ACCEPTED, key="f2")
+def render_report(rec: dict[str, Any]) -> None:
+    """Render a full report (used for both fresh analyses and stored history)."""
+    d1, d2, m, alerts = rec["data1"], rec["data2"], rec["metrics"], rec["alerts"]
+    l1, l2, cur = rec["label1"], rec["label2"], rec.get("currency") or ""
 
-run = st.button("🔍 Analyze & Compare", type="primary", disabled=not (file1 and file2))
+    st.caption(f"{l1}: {rec.get('period1') or '?'}  ·  {l2}: {rec.get('period2') or '?'}  ·  "
+               f"Currency: {cur or '?'}  ·  Files: {rec.get('file1_name')}, {rec.get('file2_name')}")
 
-if run:
-    if not api_key:
-        st.error("Please enter your Gemini API key in the sidebar.")
-        st.stop()
+    c1, c2, c3, c4 = st.columns(4)
+    metric_card(c1, "Total Income", fmt_money(d2["total_income"], cur),
+                d2["total_income"] - d1["total_income"], pct_change(d1["total_income"], d2["total_income"]))
+    metric_card(c2, "Total Expense", fmt_money(d2["total_expense"], cur),
+                d2["total_expense"] - d1["total_expense"], pct_change(d1["total_expense"], d2["total_expense"]),
+                invert=True)
+    metric_card(c3, "Net Profit", fmt_money(d2["net_profit"], cur),
+                d2["net_profit"] - d1["net_profit"], pct_change(d1["net_profit"], d2["net_profit"]))
+    pm1, pm2 = safe_div(d1["net_profit"], d1["total_income"]), safe_div(d2["net_profit"], d2["total_income"])
+    metric_card(c4, "Profit Margin", "-" if is_missing(pm2) else f"{pm2 * 100:.1f}%",
+                None if is_missing(pm1) or is_missing(pm2) else (pm2 - pm1) * 100, None, unit="pts")
 
-    try:
-        with st.spinner(f"Extracting {label1} with Gemini..."):
-            d1 = extract_financials(api_key, model, file1.getvalue(), file1.name)
-        with st.spinner(f"Extracting {label2} with Gemini..."):
-            d2 = extract_financials(api_key, model, file2.getvalue(), file2.name)
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Extraction failed: {exc}")
-        st.stop()
+    st.markdown("### 🧭 CEO Quick Summary")
+    if rec.get("summary"):
+        st.markdown(f'<div class="ace-summary">\n\n{rec["summary"]}\n\n</div>', unsafe_allow_html=True)
+    else:
+        st.info("No AI summary stored for this report.")
 
-    for d in (d1, d2):
-        for k in ("total_income", "total_expense", "net_profit", "opening_balance", "closing_balance"):
-            d[k] = float(d.get(k) or 0)
-
-    cur = d2.get("currency") or d1.get("currency") or ""
-
-    # ------------------------------------------------------------------ #
-    # Summary metrics
-    # ------------------------------------------------------------------ #
-    st.markdown("## 📌 Summary")
-    st.caption(f"{label1}: {d1.get('period', '?')}  |  {label2}: {d2.get('period', '?')}  |  Currency: {cur}")
-
-    m1, m2, m3 = st.columns(3)
-    for col, key, name in ((m1, "total_income", "Total Income"), (m2, "total_expense", "Total Expense"), (m3, "net_profit", "Net Profit")):
-        ch = pct_change(d1[key], d2[key])
-        col.metric(
-            name,
-            fmt_money(d2[key], cur),
-            delta=f"{d2[key] - d1[key]:+,.0f} ({fmt_pct(ch)})",
-            delta_color="inverse" if key == "total_expense" else "normal",
-        )
-
-    # ------------------------------------------------------------------ #
-    # Comparison table (add / subtract)
-    # ------------------------------------------------------------------ #
-    st.markdown("## ➕➖ Totals & Net Difference")
-    rows = []
-    for key, name in (
-        ("opening_balance", "Opening Balance"),
-        ("total_income", "Total Income"),
-        ("total_expense", "Total Expense"),
-        ("net_profit", "Net Profit"),
-        ("closing_balance", "Closing Balance"),
-    ):
-        rows.append({
-            "Item": name,
-            label1: d1[key],
-            label2: d2[key],
-            "Difference (M2 - M1)": d2[key] - d1[key],
-            "Combined (M1 + M2)": d1[key] + d2[key],
-            "Change %": pct_change(d1[key], d2[key]),
-        })
-    totals_df = pd.DataFrame(rows)
-    st.dataframe(
-        totals_df.style.format({label1: "{:,.0f}", label2: "{:,.0f}", "Difference (M2 - M1)": "{:+,.0f}",
-                                "Combined (M1 + M2)": "{:,.0f}", "Change %": lambda v: fmt_pct(v)}),
-        use_container_width=True, hide_index=True,
-    )
-
-    # ------------------------------------------------------------------ #
-    # Ratios (multiply / divide)
-    # ------------------------------------------------------------------ #
-    st.markdown("## ✖️➗ Growth Rates & Ratios")
-    ratio_rows = [
-        {"Metric": "Income growth rate", label1: None, label2: pct_change(d1["total_income"], d2["total_income"]), "unit": "%"},
-        {"Metric": "Expense growth rate", label1: None, label2: pct_change(d1["total_expense"], d2["total_expense"]), "unit": "%"},
-        {"Metric": "Net profit growth rate", label1: None, label2: pct_change(d1["net_profit"], d2["net_profit"]), "unit": "%"},
-        {"Metric": "Profit margin (net / income)",
-         label1: (safe_ratio(d1["net_profit"], d1["total_income"]) or 0) * 100,
-         label2: (safe_ratio(d2["net_profit"], d2["total_income"]) or 0) * 100, "unit": "%"},
-        {"Metric": "Expense ratio (expense / income)",
-         label1: (safe_ratio(d1["total_expense"], d1["total_income"]) or 0) * 100,
-         label2: (safe_ratio(d2["total_expense"], d2["total_income"]) or 0) * 100, "unit": "%"},
-        {"Metric": "Income / Expense multiple (x)",
-         label1: safe_ratio(d1["total_income"], d1["total_expense"]),
-         label2: safe_ratio(d2["total_income"], d2["total_expense"]), "unit": "x"},
-        {"Metric": "Income multiplier M2 / M1 (x)", label1: None,
-         label2: safe_ratio(d2["total_income"], d1["total_income"]), "unit": "x"},
-    ]
-
-    def _fmt_ratio(v, unit):
-        if v is None:
-            return "-"
-        return f"{v:.1f}%" if unit == "%" else f"{v:.2f}x"
-
-    ratio_df = pd.DataFrame([
-        {"Metric": r["Metric"], label1: _fmt_ratio(r[label1], r["unit"]), label2: _fmt_ratio(r[label2], r["unit"])}
-        for r in ratio_rows
-    ])
-    st.dataframe(ratio_df, use_container_width=True, hide_index=True)
-
-    # ------------------------------------------------------------------ #
-    # Category-level breakdown
-    # ------------------------------------------------------------------ #
-    st.markdown("## 📂 Category Breakdown")
-    inc_cmp = compare_items(d1.get("income_items", []), d2.get("income_items", []), label1, label2)
-    exp_cmp = compare_items(d1.get("expense_items", []), d2.get("expense_items", []), label1, label2)
-
-    fmt_cat = {label1: "{:,.0f}", label2: "{:,.0f}", "Difference": "{:+,.0f}", "Change %": lambda v: fmt_pct(v)}
-    t1, t2 = st.tabs(["Income by category", "Expense by category"])
-    with t1:
-        if inc_cmp.empty:
-            st.info("No income line items were extracted.")
-        else:
-            st.dataframe(inc_cmp.style.format(fmt_cat), use_container_width=True, hide_index=True)
-            st.bar_chart(inc_cmp.set_index("category")[[label1, label2]])
-    with t2:
-        if exp_cmp.empty:
-            st.info("No expense line items were extracted.")
-        else:
-            st.dataframe(exp_cmp.style.format(fmt_cat), use_container_width=True, hide_index=True)
-            st.bar_chart(exp_cmp.set_index("category")[[label1, label2]])
-
-    # ------------------------------------------------------------------ #
-    # Alerts
-    # ------------------------------------------------------------------ #
-    st.markdown("## 🚨 Discrepancy Alerts")
-    alerts = build_alerts(d1, d2, inc_cmp, exp_cmp, threshold)
+    st.markdown("### 🚨 Red Flags & Alerts")
     if not alerts:
         st.success("No discrepancies or abnormal changes detected.")
-    else:
-        for sev, msg in alerts:
-            getattr(st, sev)(msg)
+    for a in alerts:
+        getattr(st, a["severity"])(a["message"])
 
-    # ------------------------------------------------------------------ #
-    # Raw extraction & downloads
-    # ------------------------------------------------------------------ #
+    st.markdown("### ➕➖ Totals & Net Variance")
+    totals_df = pd.DataFrame(m["totals"])
+    st.dataframe(totals_df.style.format({l1: "{:,.0f}", l2: "{:,.0f}", "Net Variance": "{:+,.0f}",
+                                         "Combined": "{:,.0f}", "Change %": fmt_pct}),
+                 use_container_width=True, hide_index=True)
+
+    st.markdown("### ✖️➗ Growth Rates & Ratios")
+    def _fr(v, unit):
+        return "-" if is_missing(v) else (f"{v:.1f}%" if unit == "%" else f"{v:.2f}x")
+    ratio_df = pd.DataFrame([{"Metric": r["Metric"], l1: _fr(r.get(l1), r["unit"]),
+                              l2: _fr(r.get(l2), r["unit"])} for r in m["ratios"]])
+    st.dataframe(ratio_df, use_container_width=True, hide_index=True)
+
+    st.markdown("### 📂 Category Breakdown")
+    fmt_cat = {l1: "{:,.0f}", l2: "{:,.0f}", "Difference": "{:+,.0f}", "Change %": fmt_pct}
+    t1, t2 = st.tabs(["Income by category", "Expense by category"])
+    for tab, rows in ((t1, m["income_by_category"]), (t2, m["expense_by_category"])):
+        with tab:
+            df = pd.DataFrame(rows)
+            if df.empty:
+                st.info("No line items were extracted.")
+            else:
+                st.dataframe(df.style.format(fmt_cat), use_container_width=True, hide_index=True)
+                st.bar_chart(df.set_index("category")[[l1, l2]])
+
     with st.expander("🔎 Raw AI extraction (JSON)"):
-        c1, c2 = st.columns(2)
-        c1.json(d1)
-        c2.json(d2)
+        a, b = st.columns(2)
+        a.json(d1)
+        b.json(d2)
 
-    report = {
-        "labels": {"month1": label1, "month2": label2},
-        "month1": d1,
-        "month2": d2,
-        "totals": totals_df.to_dict(orient="records"),
-        "ratios": ratio_rows,
-        "income_by_category": inc_cmp.to_dict(orient="records"),
-        "expense_by_category": exp_cmp.to_dict(orient="records"),
-        "alerts": [{"severity": s, "message": m} for s, m in alerts],
-    }
-    dl1, dl2 = st.columns(2)
-    dl1.download_button(
-        "⬇️ Download report (JSON)",
-        data=json.dumps(report, indent=2, ensure_ascii=False, default=str),
-        file_name="comparison_report.json",
-        mime="application/json",
-    )
-    dl2.download_button(
-        "⬇️ Download totals (CSV)",
-        data=totals_df.to_csv(index=False),
-        file_name="comparison_totals.csv",
-        mime="text/csv",
-    )
+    st.download_button("⬇️ Download report (JSON)",
+                       data=json.dumps(rec, indent=2, ensure_ascii=False, default=str),
+                       file_name=f"ace_report_{rec.get('id', 'new')}.json", mime="application/json",
+                       key=f"dl_{rec.get('id', 'new')}")
+
+
+# =========================================================================== #
+# Passcode gate
+# =========================================================================== #
+def require_passcode() -> None:
+    expected = secret("APP_PASSCODE")
+    if not expected:
+        st.error("APP_PASSCODE is not configured. Set it as an environment variable or in "
+                 ".streamlit/secrets.toml, then restart the app.")
+        st.stop()
+    if st.session_state.get("authenticated"):
+        return
+
+    st.markdown('<div class="ace-hero"><h1>📊 ACE Audit AI</h1>'
+                '<p>Executive Financial Comparison Dashboard · Restricted access</p></div>',
+                unsafe_allow_html=True)
+    _, mid, _ = st.columns([1, 1.2, 1])
+    with mid:
+        with st.form("login"):
+            code = st.text_input("Enter passcode", type="password")
+            ok = st.form_submit_button("Unlock", type="primary", use_container_width=True)
+        if ok:
+            if hmac.compare_digest(code.strip(), expected):
+                st.session_state["authenticated"] = True
+                st.rerun()
+            st.error("Incorrect passcode.")
+    st.stop()
+
+
+require_passcode()
+
+# =========================================================================== #
+# Sidebar
+# =========================================================================== #
+with st.sidebar:
+    st.markdown("## ⚙️ Settings")
+    api_key = st.text_input("Google Gemini API Key", type="password", value=secret("GEMINI_API_KEY"),
+                            help="https://aistudio.google.com/app/apikey")
+    model = st.selectbox("Gemini model", MODEL_OPTIONS, index=0)
+    language = st.radio("Summary language", ["Myanmar", "English"], horizontal=True)
+    threshold = st.slider("Red-flag threshold (% change)", 5.0, 100.0, DEFAULT_ALERT_THRESHOLD, 5.0)
+    st.markdown("---")
+    reports = db_list_reports()
+    st.markdown(f"**📚 Stored reports:** {len(reports)}")
+    st.caption(f"Database: `{DB_PATH}`")
+    st.markdown("---")
+    if st.button("🔒 Lock dashboard"):
+        st.session_state.clear()
+        st.rerun()
+
+# =========================================================================== #
+# Main
+# =========================================================================== #
+st.markdown('<div class="ace-hero"><h1>📊 ACE Audit AI</h1>'
+            '<p>Executive Financial Comparison Dashboard · Powered by Google Gemini</p></div>',
+            unsafe_allow_html=True)
+
+tab_new, tab_history, tab_trend = st.tabs(["🆕 New Analysis", "📚 Previous Reports", "📈 Trend Viewer"])
+
+# --------------------------------------------------------------------------- #
+with tab_new:
+    c1, c2 = st.columns(2)
+    with c1:
+        label1 = st.text_input("Previous month label", "Previous Month")
+        file1 = st.file_uploader("Upload previous month statement", type=ACCEPTED_TYPES, key="f1")
+    with c2:
+        label2 = st.text_input("Current month label", "Current Month")
+        file2 = st.file_uploader("Upload current month statement", type=ACCEPTED_TYPES, key="f2")
+    title = st.text_input("Report title", f"Comparison {datetime.now():%Y-%m-%d}")
+
+    if st.button("🔍 Analyze, Summarize & Save", type="primary", disabled=not (file1 and file2)):
+        if not api_key:
+            st.error("Enter your Gemini API key in the sidebar.")
+            st.stop()
+        try:
+            with st.spinner(f"Extracting {label1}..."):
+                d1 = extract_financials(api_key, model, file1.getvalue(), file1.name)
+            with st.spinner(f"Extracting {label2}..."):
+                d2 = extract_financials(api_key, model, file2.getvalue(), file2.name)
+            metrics = compute_metrics(d1, d2, label1, label2)
+            alerts = build_alerts(d1, d2, metrics, threshold)
+            with st.spinner("Writing CEO summary..."):
+                summary = generate_ceo_summary(
+                    api_key, model,
+                    {"labels": [label1, label2], "month1": d1, "month2": d2,
+                     "totals": metrics["totals"], "ratios": metrics["ratios"], "alerts": alerts},
+                    language,
+                )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Analysis failed: {exc}")
+            st.stop()
+
+        rec = {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "title": title.strip() or f"Comparison {datetime.now():%Y-%m-%d}",
+            "label1": label1, "label2": label2,
+            "period1": d1.get("period"), "period2": d2.get("period"),
+            "currency": d2.get("currency") or d1.get("currency") or "",
+            "file1_name": file1.name, "file2_name": file2.name, "model": model,
+            "data1": d1, "data2": d2, "metrics": metrics, "alerts": alerts, "summary": summary,
+        }
+        rec["id"] = db_save_report(rec)
+        st.success(f"Saved as report #{rec['id']} — available under Previous Reports.")
+        st.session_state["last_report"] = rec
+
+    if "last_report" in st.session_state:
+        st.markdown("---")
+        render_report(st.session_state["last_report"])
+
+# --------------------------------------------------------------------------- #
+with tab_history:
+    reports = db_list_reports()
+    if not reports:
+        st.info("No reports saved yet. Run an analysis in the New Analysis tab.")
+    else:
+        options = {f"#{r['id']} · {r['created_at'][:16]} · {r['title']} "
+                   f"({r['period1'] or '?'} → {r['period2'] or '?'})": r["id"] for r in reports}
+        choice = st.selectbox("Select a past report", list(options.keys()))
+        rid = options[choice]
+        rec = db_get_report(rid)
+        if rec:
+            hc1, hc2 = st.columns([6, 1])
+            hc1.markdown(f"#### {rec['title']}")
+            if hc2.button("🗑️ Delete", key=f"del_{rid}"):
+                db_delete_report(rid)
+                st.session_state.pop("last_report", None)
+                st.rerun()
+            render_report(rec)
+
+# --------------------------------------------------------------------------- #
+with tab_trend:
+    trend = db_trend_frame()
+    if len(trend) < 2:
+        st.info("Trend lines appear once at least two reports are saved.")
+    else:
+        st.markdown("#### Income · Expense · Net Profit across saved reports (current-month figures)")
+        st.line_chart(trend.set_index("Period")[["Income", "Expense", "Net Profit"]])
+        trend["Profit Margin %"] = trend.apply(
+            lambda r: (r["Net Profit"] / r["Income"] * 100) if r["Income"] else None, axis=1)
+        st.dataframe(trend.style.format({"Income": "{:,.0f}", "Expense": "{:,.0f}",
+                                         "Net Profit": "{:,.0f}", "Profit Margin %": "{:.1f}%"}),
+                     use_container_width=True, hide_index=True)
