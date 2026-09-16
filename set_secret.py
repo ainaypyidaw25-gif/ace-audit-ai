@@ -55,8 +55,13 @@ def main() -> int:
     if not value:
         print("The clipboard is empty. Copy the value first, then run this again.")
         return 1
-    if "\n" in value:
-        print("The clipboard holds more than one line. Copy just the single value.")
+    # Any interior whitespace means a stray newline or a partial selection. Writing it would
+    # produce a multi-line TOML value, which breaks the whole file and every other secret with it.
+    if any(ch.isspace() for ch in value):
+        print("The clipboard value contains a space or line break. Copy just the single value.")
+        return 1
+    if any(ord(ch) < 32 for ch in value):
+        print("The clipboard value contains control characters. Copy it again.")
         return 1
     if name == "SUPABASE_URL" and not value.startswith("https://"):
         print(f"That does not look like a URL (starts with '{value[:8]}...'). "
@@ -67,7 +72,9 @@ def main() -> int:
         return 1
 
     values = read_existing()
-    values[name] = value.replace('"', "")
+    values[name] = value.replace('"', "").replace("\\", "")
+    # Belt and braces: never let a stored value break the file for the others.
+    values = {k: "".join(str(v).split()).replace('"', "") for k, v in values.items()}
 
     SECRETS.parent.mkdir(parents=True, exist_ok=True)
     lines = ["# Local dev only (gitignored). Written by set_secret.py."]
